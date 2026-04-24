@@ -74,6 +74,18 @@ using namespace llvm;
 
 namespace cir {
 
+// Convert a memref value to an !llvm.ptr by extracting its aligned pointer.
+static mlir::Value memrefToLLVMPtr(mlir::OpBuilder &builder, mlir::Location loc,
+                                   mlir::Value memrefVal) {
+  auto ptrTy = mlir::LLVM::LLVMPointerType::get(builder.getContext());
+  auto rawIdx = mlir::memref::ExtractAlignedPointerAsIndexOp::create(
+      builder, loc, memrefVal);
+  auto rawI64 = mlir::arith::IndexCastUIOp::create(builder, loc,
+                                                   builder.getI64Type(), rawIdx);
+  return mlir::LLVM::IntToPtrOp::create(builder, loc, ptrTy,
+                                        mlir::ValueRange{rawI64});
+}
+
 class CIRReturnLowering : public mlir::OpConversionPattern<cir::ReturnOp> {
 public:
   using OpConversionPattern<cir::ReturnOp>::OpConversionPattern;
@@ -81,8 +93,12 @@ public:
   mlir::LogicalResult
   matchAndRewrite(cir::ReturnOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
-    rewriter.replaceOpWithNewOp<mlir::func::ReturnOp>(op,
-                                                      adaptor.getOperands());
+    if (op->getParentOfType<mlir::LLVM::LLVMFuncOp>())
+      rewriter.replaceOpWithNewOp<mlir::LLVM::ReturnOp>(op,
+                                                        adaptor.getOperands());
+    else
+      rewriter.replaceOpWithNewOp<mlir::func::ReturnOp>(op,
+                                                        adaptor.getOperands());
     return mlir::LogicalResult::success();
   }
 };
@@ -227,6 +243,117 @@ public:
         return op.emitError()
                << "lowering of printf function with Format-String"
                   "defined outside of printf is not supported yet";
+      }
+
+      // General handler for extern variadic calls (fprintf, polybench timers,
+      // etc.).  Look up the original cir.func to check isVarArg before it gets
+      // replaced by llvm.func.
+      if (auto callee = op.getCallee()) {
+        auto parentModule = op->getParentOfType<mlir::ModuleOp>();
+        if (auto cirFn = parentModule.lookupSymbol<cir::FuncOp>(*callee)) {
+          if (cirFn.getFunctionType().isVarArg()) {
+            auto *context = rewriter.getContext();
+            auto llvmPtrTy = mlir::LLVM::LLVMPointerType::get(context);
+            auto cirFnType = cirFn.getFunctionType();
+
+            // Rebuild LLVM function type (mirrors CIRFuncOpLowering logic).
+            SmallVector<mlir::Type> llvmParams;
+            for (auto paramType : cirFnType.getInputs()) {
+              auto converted = typeConverter->convertType(paramType);
+              if (!converted)
+                return mlir::failure();
+              llvmParams.push_back(mlir::LLVM::isCompatibleType(converted)
+                                       ? converted
+                                       : llvmPtrTy);
+            }
+            mlir::Type retType;
+            auto cirRetType = cirFnType.getReturnType();
+            if (!cirRetType || isa<cir::VoidType>(cirRetType))
+              retType = mlir::LLVM::LLVMVoidType::get(context);
+            else {
+              auto converted = typeConverter->convertType(cirRetType);
+              retType = (converted && mlir::LLVM::isCompatibleType(converted))
+                            ? converted
+                            : mlir::LLVM::LLVMVoidType::get(context);
+            }
+            auto llvmFnType = mlir::LLVM::LLVMFunctionType::get(
+                retType, llvmParams, /*isVarArg=*/true);
+
+            // Convert each operand to an LLVM-compatible type.
+            SmallVector<mlir::Value> newOperands;
+            SmallVector<mlir::Operation *> toErase;
+            for (auto convVal : adaptor.getOperands()) {
+              auto ty = convVal.getType();
+              if (mlir::LLVM::isCompatibleType(ty)) {
+                // Already LLVM-compatible (llvm.ptr, i32, f64, …).
+                newOperands.push_back(convVal);
+              } else if (mlir::isa<mlir::MemRefType>(ty)) {
+                // Check for inline string-literal pattern:
+                //   memref.reinterpret_cast(memref.get_global(@str))
+                if (auto rcOp =
+                        convVal.getDefiningOp<mlir::memref::ReinterpretCastOp>()) {
+                  if (auto ggOp =
+                          rcOp->getOperand(0)
+                              .getDefiningOp<mlir::memref::GetGlobalOp>()) {
+                    auto globalOp = parentModule.lookupSymbol<mlir::memref::GlobalOp>(
+                        ggOp.getNameAttr());
+                    if (!globalOp)
+                      return op.emitError()
+                             << "cannot find global " << ggOp.getName()
+                             << " for variadic string arg";
+                    auto initAttr =
+                        mlir::dyn_cast_or_null<mlir::DenseIntElementsAttr>(
+                            globalOp.getInitialValueAttr());
+                    if (!initAttr)
+                      return op.emitError()
+                             << "unsupported initializer for variadic string arg";
+
+                    rewriter.setInsertionPoint(globalOp);
+                    auto llvmArrTy = mlir::LLVM::LLVMArrayType::get(
+                        mlir::IntegerType::get(context, 8),
+                        initAttr.getNumElements());
+                    auto llvmGlobal = mlir::LLVM::GlobalOp::create(
+                        rewriter, globalOp->getLoc(), llvmArrTy, true,
+                        mlir::LLVM::Linkage::Internal,
+                        "vararg_str_" + globalOp.getSymName().str(), initAttr,
+                        0);
+
+                    rewriter.setInsertionPoint(ggOp);
+                    auto addrOf = mlir::LLVM::AddressOfOp::create(
+                        rewriter, ggOp->getLoc(), llvmGlobal);
+                    mlir::Value cst0 = mlir::LLVM::ConstantOp::create(
+                        rewriter, ggOp->getLoc(), rewriter.getI8Type(),
+                        rewriter.getIndexAttr(0));
+                    auto gep = mlir::LLVM::GEPOp::create(
+                        rewriter, ggOp->getLoc(), llvmPtrTy,
+                        llvmGlobal.getType(), addrOf,
+                        ArrayRef<mlir::Value>({cst0, cst0}));
+
+                    rewriter.setInsertionPoint(op);
+                    newOperands.push_back(gep);
+                    toErase.push_back(rcOp);
+                    toErase.push_back(ggOp);
+                    toErase.push_back(globalOp);
+                    continue;
+                  }
+                }
+                // Generic memref → extract aligned pointer.
+                rewriter.setInsertionPoint(op);
+                newOperands.push_back(
+                    memrefToLLVMPtr(rewriter, op.getLoc(), convVal));
+              } else {
+                return op.emitError()
+                       << "unsupported operand type for variadic call: " << ty;
+              }
+            }
+
+            rewriter.replaceOpWithNewOp<mlir::LLVM::CallOp>(
+                op, llvmFnType, op.getCalleeAttr(), newOperands);
+            for (auto *deadOp : llvm::reverse(toErase))
+              rewriter.eraseOp(deadOp);
+            return mlir::LogicalResult::success();
+          }
+        }
       }
 
       rewriter.replaceOpWithNewOp<mlir::func::CallOp>(
@@ -817,24 +944,54 @@ public:
     auto fnType = op.getFunctionType();
 
     if (fnType.isVarArg()) {
-      // TODO: once the func dialect supports variadic functions rewrite this
-      // For now only insert special handling of printf via the llvmir dialect
-      if (op.getSymName().equals_insensitive("printf")) {
-        auto *context = rewriter.getContext();
-        // Create a llvmir dialect function declaration for printf, the
-        // signature is: i32 (!llvm.ptr, ...)
-        auto llvmI32Ty = mlir::IntegerType::get(context, 32);
-        auto llvmPtrTy = mlir::LLVM::LLVMPointerType::get(context);
-        auto llvmFnType =
-            mlir::LLVM::LLVMFunctionType::get(llvmI32Ty, llvmPtrTy,
-                                              /*isVarArg=*/true);
-        auto printfFunc = mlir::LLVM::LLVMFuncOp::create(rewriter, op.getLoc(),
-                                                         "printf", llvmFnType);
-        rewriter.replaceOp(op, printfFunc);
+      auto *context = rewriter.getContext();
+      auto llvmPtrTy = mlir::LLVM::LLVMPointerType::get(context);
+
+      // Build LLVM types for the fixed parameters.
+      SmallVector<mlir::Type> llvmParams;
+      for (auto paramType : fnType.getInputs()) {
+        auto converted = typeConverter->convertType(paramType);
+        if (!converted)
+          return mlir::failure();
+        llvmParams.push_back(mlir::LLVM::isCompatibleType(converted)
+                                 ? converted
+                                 : llvmPtrTy);
+      }
+
+      // Build LLVM return type.
+      mlir::Type retType;
+      auto cirRetType = fnType.getReturnType();
+      if (!cirRetType || isa<cir::VoidType>(cirRetType)) {
+        retType = mlir::LLVM::LLVMVoidType::get(context);
       } else {
+        auto converted = typeConverter->convertType(cirRetType);
+        retType = (converted && mlir::LLVM::isCompatibleType(converted))
+                      ? converted
+                      : mlir::LLVM::LLVMVoidType::get(context);
+      }
+
+      auto llvmFnType = mlir::LLVM::LLVMFunctionType::get(retType, llvmParams,
+                                                           /*isVarArg=*/true);
+
+      if (op.isDeclaration()) {
+        // Extern variadic declaration: emit llvm.func with no body.
+        rewriter.replaceOpWithNewOp<mlir::LLVM::LLVMFuncOp>(op, op.getName(),
+                                                             llvmFnType);
+      } else {
+        // Variadic function definition: emit llvm.func with the body inlined.
+        // The body's CIR ops are lowered by existing patterns; cir.return is
+        // handled by CIRReturnLowering (which checks for llvm.func parent).
+        mlir::TypeConverter::SignatureConversion sigConv(fnType.getNumInputs());
+        for (const auto &[i, llvmTy] : llvm::enumerate(llvmParams))
+          sigConv.addInputs(i, llvmTy);
+
+        auto fn = mlir::LLVM::LLVMFuncOp::create(rewriter, op.getLoc(),
+                                                  op.getName(), llvmFnType);
+        if (failed(rewriter.convertRegionTypes(&op.getBody(), *typeConverter,
+                                               &sigConv)))
+          return mlir::failure();
+        rewriter.inlineRegionBefore(op.getBody(), fn.getBody(), fn.end());
         rewriter.eraseOp(op);
-        return op.emitError() << "lowering of variadic functions (except "
-                                 "printf) not supported yet";
       }
     } else {
       mlir::TypeConverter::SignatureConversion signatureConversion(
@@ -1989,6 +2146,58 @@ public:
   }
 };
 
+class CIRVAStartOpLowering : public mlir::OpConversionPattern<cir::VAStartOp> {
+public:
+  using OpConversionPattern<cir::VAStartOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(cir::VAStartOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto ptr = memrefToLLVMPtr(rewriter, op.getLoc(), adaptor.getArgList());
+    rewriter.replaceOpWithNewOp<mlir::LLVM::VaStartOp>(op, ptr);
+    return mlir::success();
+  }
+};
+
+class CIRVAEndOpLowering : public mlir::OpConversionPattern<cir::VAEndOp> {
+public:
+  using OpConversionPattern<cir::VAEndOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(cir::VAEndOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto ptr = memrefToLLVMPtr(rewriter, op.getLoc(), adaptor.getArgList());
+    rewriter.replaceOpWithNewOp<mlir::LLVM::VaEndOp>(op, ptr);
+    return mlir::success();
+  }
+};
+
+class CIRVACopyOpLowering : public mlir::OpConversionPattern<cir::VACopyOp> {
+public:
+  using OpConversionPattern<cir::VACopyOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(cir::VACopyOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    auto src = memrefToLLVMPtr(rewriter, op.getLoc(), adaptor.getSrcList());
+    auto dst = memrefToLLVMPtr(rewriter, op.getLoc(), adaptor.getDstList());
+    rewriter.replaceOpWithNewOp<mlir::LLVM::VaCopyOp>(op, src, dst);
+    return mlir::success();
+  }
+};
+
+class CIRVAArgOpLowering : public mlir::OpConversionPattern<cir::VAArgOp> {
+public:
+  using OpConversionPattern<cir::VAArgOp>::OpConversionPattern;
+
+  mlir::LogicalResult
+  matchAndRewrite(cir::VAArgOp op, OpAdaptor adaptor,
+                  mlir::ConversionPatternRewriter &rewriter) const override {
+    return op.emitError("cir.va.arg lowering not yet supported "
+                        "(requires ABI-specific va_arg expansion)");
+  }
+};
+
 void populateCIRToMLIRConversionPatterns(mlir::RewritePatternSet &patterns,
                                          mlir::TypeConverter &converter) {
   patterns.add<CIRReturnLowering, CIRBrOpLowering>(patterns.getContext());
@@ -2012,8 +2221,9 @@ void populateCIRToMLIRConversionPatterns(mlir::RewritePatternSet &patterns,
            CIRIfOpLowering, CIRScopeOpLowering, CIRVectorCreateLowering,
            CIRVectorInsertLowering, CIRVectorExtractLowering,
            CIRVectorCmpOpLowering, CIRACosOpLowering, CIRASinOpLowering,
-           CIRUnreachableOpLowering, CIRTrapOpLowering, CIRCopyOpLowering>(
-          converter, patterns.getContext());
+           CIRUnreachableOpLowering, CIRTrapOpLowering, CIRCopyOpLowering,
+           CIRVAStartOpLowering, CIRVAEndOpLowering, CIRVACopyOpLowering,
+           CIRVAArgOpLowering>(converter, patterns.getContext());
 }
 
 static mlir::Attribute
@@ -2040,9 +2250,10 @@ static mlir::TypeConverter prepareTypeConverter() {
   mlir::TypeConverter converter;
   converter.addConversion([&](cir::PointerType type) -> mlir::Type {
     auto ty = convertTypeForMemory(converter, type.getPointee());
-    // FIXME: The pointee type might not be converted (e.g. struct)
     if (!ty)
-      return nullptr;
+      // Fallback for unconvertible pointee types (structs, void*, etc.):
+      // use an opaque LLVM pointer so calls with FILE* etc. can proceed.
+      return mlir::LLVM::LLVMPointerType::get(type.getContext());
     if (isa<cir::ArrayType>(type.getPointee()))
       return ty;
     auto maybeAddrSpace =

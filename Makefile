@@ -25,7 +25,7 @@ CMAKE_FLAGS       := $(CMAKE_COMMON) -DCMAKE_BUILD_TYPE=Release
 CMAKE_FLAGS_DEBUG := $(CMAKE_COMMON) -DCMAKE_BUILD_TYPE=RelWithDebInfo
 
 .PHONY: all configure configure-debug build clang cir-opt cir-opt-debug \
-        test-throughmlir run run-debug c2cir c2mlir clean help
+        filecheck littools test-throughmlir run run-debug c2cir c2mlir clean help
 
 # Default: just cir-opt for fast iteration on lowering code
 all: cir-opt
@@ -83,9 +83,16 @@ run: cir-opt
 run-debug: cir-opt
 	$(SYMBOLIZER) $(CIR_OPT) $(FILE) --cir-to-mlir
 
+# Build FileCheck and other lit tools (needed for lit tests)
+filecheck: $(BUILD_DIR)/build.ninja
+	ninja -C $(BUILD_DIR) FileCheck
+
+littools: $(BUILD_DIR)/build.ninja
+	ninja -C $(BUILD_DIR) FileCheck count not llvm-symbolizer mlir-translate llvm-config
+
 # Run the ThroughMLIR lit test suite
-test-throughmlir: cir-opt
-	$(BUILD_DIR)/bin/llvm-lit -v \
+test-throughmlir: cir-opt littools
+	PATH=$(BUILD_DIR)/bin:$$PATH $(BUILD_DIR)/bin/llvm-lit -v \
 		--path $(BUILD_DIR)/bin \
 		clang/test/CIR/Lowering/ThroughMLIR/
 

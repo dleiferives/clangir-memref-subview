@@ -1515,12 +1515,58 @@ public:
     switch (op.getKind()) {
     case CIR::array_to_ptrdecay: {
       auto newDstType = llvm::cast<mlir::MemRefType>(convertTy(dstType));
-      llvm::SmallVector<mlir::OpFoldResult> sizes, strides;
-      if (mlir::failed(prepareReinterpretMetadata(newDstType, rewriter, sizes,
-                                                  strides, op.getOperation())))
+      auto srcMemref = llvm::cast<mlir::MemRefType>(src.getType());
+      auto loc = op.getLoc();
+
+      // Multi-dim sources (e.g. memref<100x100xi32> -> memref<100xi32>) are
+      // rank-reducing decays. subview cannot reduce rank, so fall back to
+      // reinterpret_cast for those cases.
+      if (srcMemref.getRank() != 1) {
+        llvm::SmallVector<mlir::OpFoldResult> sizes, strides;
+        if (mlir::failed(prepareReinterpretMetadata(newDstType, rewriter, sizes,
+                                                    strides, op.getOperation())))
+          return mlir::failure();
+        rewriter.replaceOpWithNewOp<mlir::memref::ReinterpretCastOp>(
+            op, newDstType, src, rewriter.getIndexAttr(0), sizes, strides);
+        return mlir::success();
+      }
+
+      // 1-D source: emit subview so alias-analysis passes can see the
+      // offset/size structure. The reinterpret_cast wrapper normalises the
+      // result type; findBaseAndIndices peels it at load/store time.
+      mlir::Value zero = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
+      mlir::Value one = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
+
+      mlir::Value size;
+      int64_t staticSize = srcMemref.getShape()[0];
+      if (mlir::ShapedType::isDynamic(staticSize)) {
+        mlir::Value dimIdx =
+            mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
+        size = mlir::memref::DimOp::create(rewriter, loc, src, dimIdx);
+      } else {
+        size = mlir::arith::ConstantIndexOp::create(rewriter, loc, staticSize);
+      }
+
+      llvm::SmallVector<mlir::OpFoldResult> svOffsets = {
+          mlir::OpFoldResult(zero)};
+      llvm::SmallVector<mlir::OpFoldResult> svSizes = {mlir::OpFoldResult(size)};
+      llvm::SmallVector<mlir::OpFoldResult> svStrides = {
+          mlir::OpFoldResult(one)};
+
+      auto svType = mlir::memref::SubViewOp::inferResultType(srcMemref,
+                                                             svOffsets, svSizes,
+                                                             svStrides);
+      auto sv = mlir::memref::SubViewOp::create(
+          rewriter, loc, llvm::cast<mlir::MemRefType>(svType), src, svOffsets,
+          svSizes, svStrides);
+
+      llvm::SmallVector<mlir::OpFoldResult> rcSizes, rcStrides;
+      if (mlir::failed(prepareReinterpretMetadata(newDstType, rewriter, rcSizes,
+                                                  rcStrides, op.getOperation())))
         return mlir::failure();
       rewriter.replaceOpWithNewOp<mlir::memref::ReinterpretCastOp>(
-          op, newDstType, src, rewriter.getIndexAttr(0), sizes, strides);
+          op, newDstType, sv.getResult(), mlir::OpFoldResult(zero), rcSizes,
+          rcStrides);
       return mlir::success();
     }
     case CIR::int_to_bool: {
@@ -1614,53 +1660,53 @@ class CIRGetElementOpLowering
     : public mlir::OpConversionPattern<cir::GetElementOp> {
   using mlir::OpConversionPattern<cir::GetElementOp>::OpConversionPattern;
 
-  bool isLoadStoreOrGetProducer(cir::GetElementOp op) const {
-    for (auto *user : op->getUsers()) {
-      if (!op->isBeforeInBlock(user))
-        return false;
-      if (isa<cir::LoadOp, cir::StoreOp, cir::GetElementOp>(*user))
-        continue;
-      return false;
-    }
-    return true;
-  }
-
   // Rewrite
   //        cir.get_element(%base[%index])
   // to
-  //        memref.reinterpret_cast (%base, %stride)
+  //        memref.subview(%base[%index][1][1]) + memref.reinterpret_cast
   //
-  // MemRef Dialect doesn't have GEP-like operation. memref.reinterpret_cast
-  // only been used to propagate %base and %index to memref.load/store and
-  // should be erased after the conversion.
+  // The subview carries structural offset/size information needed by alias
+  // analysis passes. The reinterpret_cast wrapper normalises the type to the
+  // expected memref<?xT> and is peeled off by findBaseAndIndices at load/store
+  // time, leaving the subview alive in the IR.
   mlir::LogicalResult
   matchAndRewrite(cir::GetElementOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
-    // Only rewrite if all users are load/stores.
-    if (!isLoadStoreOrGetProducer(op))
-      return mlir::failure();
-
     // Cast the index to the index type, if needed.
     auto index = adaptor.getIndex();
     auto indexType = rewriter.getIndexType();
+    auto loc = op.getLoc();
     if (index.getType() != indexType)
-      index = mlir::arith::IndexCastOp::create(rewriter, op.getLoc(), indexType,
-                                               index);
+      index =
+          mlir::arith::IndexCastOp::create(rewriter, loc, indexType, index);
 
     // Convert the destination type.
     auto dstType =
         cast<mlir::MemRefType>(getTypeConverter()->convertType(op.getType()));
+    auto baseMemref =
+        llvm::cast<mlir::MemRefType>(adaptor.getBase().getType());
 
-    // Replace the GetElementOp with a memref.reinterpret_cast.
-    llvm::SmallVector<mlir::OpFoldResult> sizes, strides;
-    if (mlir::failed(prepareReinterpretMetadata(dstType, rewriter, sizes,
-                                                strides, op.getOperation())))
+    mlir::Value one = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
+    mlir::Value zero = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
+
+    llvm::SmallVector<mlir::OpFoldResult> svOffsets = {
+        mlir::OpFoldResult(index)};
+    llvm::SmallVector<mlir::OpFoldResult> svSizes = {mlir::OpFoldResult(one)};
+    llvm::SmallVector<mlir::OpFoldResult> svStrides = {mlir::OpFoldResult(one)};
+
+    auto svType = mlir::memref::SubViewOp::inferResultType(baseMemref, svOffsets,
+                                                           svSizes, svStrides);
+    auto sv = mlir::memref::SubViewOp::create(
+        rewriter, loc, llvm::cast<mlir::MemRefType>(svType), adaptor.getBase(),
+        svOffsets, svSizes, svStrides);
+
+    llvm::SmallVector<mlir::OpFoldResult> rcSizes, rcStrides;
+    if (mlir::failed(prepareReinterpretMetadata(dstType, rewriter, rcSizes,
+                                                rcStrides, op.getOperation())))
       return mlir::failure();
     rewriter.replaceOpWithNewOp<mlir::memref::ReinterpretCastOp>(
-        op, dstType, adaptor.getBase(),
-        /*offset=*/index,
-        /*sizes=*/sizes,
-        /*strides=*/strides);
+        op, dstType, sv.getResult(), mlir::OpFoldResult(zero), rcSizes,
+        rcStrides);
 
     return mlir::success();
   }
@@ -1670,21 +1716,6 @@ class CIRPtrStrideOpLowering
     : public mlir::OpConversionPattern<cir::PtrStrideOp> {
 public:
   using mlir::OpConversionPattern<cir::PtrStrideOp>::OpConversionPattern;
-
-  // Return true if PtrStrideOp is produced by cast with array_to_ptrdecay kind
-  // and they are in the same block.
-  inline bool isCastArrayToPtrConsumer(cir::PtrStrideOp op) const {
-    auto castOp = op->getOperand(0).getDefiningOp<cir::CastOp>();
-    if (!castOp)
-      return false;
-    if (castOp.getKind() != cir::CastKind::array_to_ptrdecay)
-      return false;
-    if (!castOp->hasOneUse())
-      return false;
-    if (!castOp->isBeforeInBlock(op))
-      return false;
-    return true;
-  }
 
   // Return true if all the PtrStrideOp users are load, store or cast
   // with array_to_ptrdecay kind and they are in the same block.
@@ -1711,8 +1742,12 @@ public:
   // Rewrite
   //        cir.ptr_stride(%base, %stride)
   // to
-  //        memref.reinterpret_cast (%base, %stride)
+  //        memref.subview(%base[%stride][dim0-stride][1]) +
+  //        memref.reinterpret_cast
   //
+  // The subview carries structural offset/size information: its offset is the
+  // same SSA value used as a size operand in a preceding array_to_ptrdecay
+  // subview, enabling alias analysis passes to detect Form A disjointness.
   mlir::LogicalResult rewritePtrStrideToReinterpret(
       cir::PtrStrideOp op, mlir::Value base, OpAdaptor adaptor,
       mlir::ConversionPatternRewriter &rewriter) const {
@@ -1720,40 +1755,49 @@ public:
     auto memrefType = llvm::cast<mlir::MemRefType>(convertTy(ptrType));
     auto stride = adaptor.getStride();
     auto indexType = rewriter.getIndexType();
-    // Generate casting if the stride is not index type.
+    auto loc = op.getLoc();
     if (stride.getType() != indexType)
-      stride = mlir::arith::IndexCastOp::create(rewriter, op.getLoc(),
-                                                indexType, stride);
+      stride =
+          mlir::arith::IndexCastOp::create(rewriter, loc, indexType, stride);
 
+    // Compute remaining size = dim(base, 0) - stride.
+    auto baseMemref = llvm::cast<mlir::MemRefType>(base.getType());
+    mlir::Value totalSize;
+    int64_t staticSize = baseMemref.getShape()[0];
+    if (mlir::ShapedType::isDynamic(staticSize)) {
+      mlir::Value dimIdx =
+          mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
+      totalSize = mlir::memref::DimOp::create(rewriter, loc, base, dimIdx);
+    } else {
+      totalSize =
+          mlir::arith::ConstantIndexOp::create(rewriter, loc, staticSize);
+    }
+    mlir::Value remaining =
+        mlir::arith::SubIOp::create(rewriter, loc, totalSize, stride);
+
+    mlir::Value one = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
+
+    llvm::SmallVector<mlir::OpFoldResult> svOffsets = {
+        mlir::OpFoldResult(stride)};
+    llvm::SmallVector<mlir::OpFoldResult> svSizes = {
+        mlir::OpFoldResult(remaining)};
+    llvm::SmallVector<mlir::OpFoldResult> svStrides = {mlir::OpFoldResult(one)};
+
+    auto svType = mlir::memref::SubViewOp::inferResultType(baseMemref, svOffsets,
+                                                           svSizes, svStrides);
+    auto sv = mlir::memref::SubViewOp::create(
+        rewriter, loc, llvm::cast<mlir::MemRefType>(svType), base, svOffsets,
+        svSizes, svStrides);
+
+    mlir::Value zero = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
+    llvm::SmallVector<mlir::OpFoldResult> rcSizes, rcStrides;
+    if (mlir::failed(prepareReinterpretMetadata(memrefType, rewriter, rcSizes,
+                                                rcStrides, op.getOperation())))
+      return mlir::failure();
     rewriter.replaceOpWithNewOp<mlir::memref::ReinterpretCastOp>(
-        op, memrefType, base, stride, mlir::ValueRange{}, mlir::ValueRange{},
-        llvm::ArrayRef<mlir::NamedAttribute>{});
+        op, memrefType, sv.getResult(), mlir::OpFoldResult(zero), rcSizes,
+        rcStrides);
 
-    return mlir::success();
-  }
-
-  // Rewrite
-  //        %0 = cir.cast array_to_ptrdecay %base
-  //        cir.ptr_stride(%0, %stride)
-  // to
-  //        memref.reinterpret_cast (%base, %stride)
-  //
-  // MemRef Dialect doesn't have GEP-like operation. memref.reinterpret_cast
-  // only been used to propogate %base and %stride to memref.load/store and
-  // should be erased after the conversion.
-  mlir::LogicalResult
-  rewriteArrayDecay(cir::PtrStrideOp op, OpAdaptor adaptor,
-                    mlir::ConversionPatternRewriter &rewriter) const {
-    auto baseDefiningOp =
-        adaptor.getBase().getDefiningOp<mlir::memref::ReinterpretCastOp>();
-    if (!baseDefiningOp)
-      return mlir::failure();
-
-    if (mlir::failed(rewritePtrStrideToReinterpret(
-            op, baseDefiningOp->getOperand(0), adaptor, rewriter)))
-      return mlir::failure();
-
-    rewriter.eraseOp(baseDefiningOp);
     return mlir::success();
   }
 
@@ -1761,76 +1805,77 @@ public:
   matchAndRewrite(cir::PtrStrideOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
     if (isLoadStoreOrCastArrayToPtrProduer(op)) {
-      if (isCastArrayToPtrConsumer(op))
-        return rewriteArrayDecay(op, adaptor, rewriter);
-      else if (!isa<cir::ArrayType>(op.getType().getPointee()))
+      if (!isa<cir::ArrayType>(op.getType().getPointee()))
         return rewritePtrStrideToReinterpret(op, adaptor.getBase(), adaptor,
                                              rewriter);
     }
 
+    // Rank-preserving subview for pointer-to-array stride. The base memref may
+    // be multi-dimensional (e.g. memref<?xNxT> for int (*p)[N]). Stride on
+    // dimension 0; all inner dimensions are preserved at their full extent.
     auto base = adaptor.getBase();
     auto stride = adaptor.getStride();
+    auto loc = op.getLoc();
+    auto indexType = rewriter.getIndexType();
+    auto baseMemref = llvm::cast<mlir::MemRefType>(base.getType());
+    int64_t rank = baseMemref.getRank();
 
-    auto ptrType = op.getType();
+    if (stride.getType() != indexType)
+      stride =
+          mlir::arith::IndexCastOp::create(rewriter, loc, indexType, stride);
 
-    int mulSize = 1;
-    auto innerMostPointee = ptrType.getPointee();
-    while (auto t1 = mlir::dyn_cast<cir::ArrayType>(innerMostPointee)) {
-      mulSize *= t1.getSize();
-      innerMostPointee = t1.getElementType();
-    }
+    mlir::Value one = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
+    mlir::Value zero = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
 
-    auto elementType = convertTy(innerMostPointee);
+    llvm::SmallVector<mlir::OpFoldResult> svOffsets, svSizes, svStrides;
 
-    auto ptrPtrType = mlir::ptr::PtrType::get(
-        rewriter.getContext(),
-        mlir::ptr::GenericSpaceAttr::get(op->getContext()));
-
-    mlir::Value elemSizeVal = mlir::ptr::TypeOffsetOp::create(
-        rewriter, op.getLoc(), rewriter.getIndexType(), elementType);
-
-    mlir::Value strideIndex = mlir::arith::IndexCastOp::create(
-        rewriter, op.getLoc(), rewriter.getIndexType(), stride);
-
-    mlir::Value offsetInnerMost = mlir::arith::MulIOp::create(
-        rewriter, op.getLoc(), strideIndex, elemSizeVal);
-
-    mlir::Value offset;
-    if (mulSize > 1) {
-      mlir::Value mulSizeConst =
-          mlir::arith::ConstantIndexOp::create(rewriter, op->getLoc(), mulSize);
-      offset = mlir::arith::MulIOp::create(rewriter, op.getLoc(),
-                                           offsetInnerMost, mulSizeConst);
+    // Dimension 0: offset = stride, size = total_d0 - stride.
+    mlir::Value totalD0;
+    int64_t staticD0 = baseMemref.getShape()[0];
+    if (mlir::ShapedType::isDynamic(staticD0)) {
+      mlir::Value dimIdx =
+          mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
+      totalD0 = mlir::memref::DimOp::create(rewriter, loc, base, dimIdx);
     } else {
-      offset = offsetInnerMost;
+      totalD0 = mlir::arith::ConstantIndexOp::create(rewriter, loc, staticD0);
+    }
+    mlir::Value remaining =
+        mlir::arith::SubIOp::create(rewriter, loc, totalD0, stride);
+    svOffsets.push_back(mlir::OpFoldResult(stride));
+    svSizes.push_back(mlir::OpFoldResult(remaining));
+    svStrides.push_back(mlir::OpFoldResult(one));
+
+    // Higher dimensions: offset = 0, size = static extent, stride = 1.
+    for (int64_t d = 1; d < rank; ++d) {
+      svOffsets.push_back(mlir::OpFoldResult(zero));
+      int64_t dimSize = baseMemref.getShape()[d];
+      if (mlir::ShapedType::isDynamic(dimSize)) {
+        mlir::Value dimIdx =
+            mlir::arith::ConstantIndexOp::create(rewriter, loc, d);
+        mlir::Value dimSizeVal =
+            mlir::memref::DimOp::create(rewriter, loc, base, dimIdx);
+        svSizes.push_back(mlir::OpFoldResult(dimSizeVal));
+      } else {
+        svSizes.push_back(rewriter.getIndexAttr(dimSize));
+      }
+      svStrides.push_back(mlir::OpFoldResult(one));
     }
 
-    auto t1 = mlir::cast<mlir::MemRefType>(base.getType());
-    auto t2 =
-        mlir::MemRefType::get(t1.getShape(), t1.getElementType(),
-                              t1.getLayout(), ptrPtrType.getMemorySpace());
+    auto svType = mlir::memref::SubViewOp::inferResultType(baseMemref, svOffsets,
+                                                           svSizes, svStrides);
+    auto sv = mlir::memref::SubViewOp::create(
+        rewriter, loc, llvm::cast<mlir::MemRefType>(svType), base, svOffsets,
+        svSizes, svStrides);
 
-    auto ptrMetaType = mlir::ptr::PtrMetadataType::get(t2);
-
-    auto fixedBase = mlir::memref::MemorySpaceCastOp::create(
-        rewriter, op->getLoc(), t2, base);
-
-    auto getMetadataOp = mlir::ptr::GetMetadataOp::create(
-        rewriter, op->getLoc(), ptrMetaType, fixedBase);
-
-    auto toPtrOp = mlir::ptr::ToPtrOp::create(rewriter, op->getLoc(),
-                                              ptrPtrType, fixedBase);
-
-    auto ptrAddOp = mlir::ptr::PtrAddOp::create(rewriter, op.getLoc(),
-                                                ptrPtrType, toPtrOp, offset);
-
-    auto fromPtrOp = mlir::ptr::FromPtrOp::create(rewriter, op.getLoc(), t2,
-                                                  ptrAddOp, getMetadataOp);
-
-    auto memrefCastOp = mlir::memref::MemorySpaceCastOp::create(
-        rewriter, op.getLoc(), t1, fromPtrOp);
-
-    rewriter.replaceOp(op, memrefCastOp);
+    auto resultMemref =
+        llvm::cast<mlir::MemRefType>(convertTy(op.getType()));
+    llvm::SmallVector<mlir::OpFoldResult> rcSizes, rcStrides;
+    if (mlir::failed(prepareReinterpretMetadata(resultMemref, rewriter, rcSizes,
+                                                rcStrides, op.getOperation())))
+      return mlir::failure();
+    rewriter.replaceOpWithNewOp<mlir::memref::ReinterpretCastOp>(
+        op, resultMemref, sv.getResult(), mlir::OpFoldResult(zero), rcSizes,
+        rcStrides);
     return mlir::success();
   }
 };

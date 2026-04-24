@@ -337,7 +337,20 @@ static bool findBaseAndIndices(mlir::Value addr, mlir::Value &base,
                                mlir::ConversionPatternRewriter &rewriter) {
   while (mlir::Operation *addrOp =
              addr.getDefiningOp<mlir::memref::ReinterpretCastOp>()) {
-    indices.push_back(addrOp->getOperand(1));
+    // Use getMixedOffsets() rather than getOperand(1) so that both static
+    // (IndexAttr) and dynamic (Value) offsets are handled correctly.
+    auto rcOp = mlir::cast<mlir::memref::ReinterpretCastOp>(addrOp);
+    auto mixedOffsets = rcOp.getMixedOffsets();
+    assert(!mixedOffsets.empty() && "reinterpret_cast must have an offset");
+    if (auto val =
+            llvm::dyn_cast_if_present<mlir::Value>(mixedOffsets[0])) {
+      indices.push_back(val);
+    } else {
+      auto intAttr =
+          mlir::cast<mlir::IntegerAttr>(mixedOffsets[0].get<mlir::Attribute>());
+      indices.push_back(mlir::arith::ConstantIndexOp::create(
+          rewriter, addrOp->getLoc(), intAttr.getInt()));
+    }
     addr = addrOp->getOperand(0);
     eraseList.push_back(addrOp);
   }
@@ -382,31 +395,36 @@ static void eraseIfSafe(mlir::Value oldAddr, mlir::Value newAddr,
   // load/store ops using an forwarded offset from the current
   // memref.reinterpret_cast op
   for (auto *user : newAddr.getUsers()) {
-    if (auto loadOpUser = mlir::dyn_cast_or_null<mlir::memref::LoadOp>(*user)) {
-      if (!loadOpUser.getIndices().empty()) {
-        if (auto reinterpretOp =
-                mlir::dyn_cast<mlir::memref::ReinterpretCastOp>(
-                    eraseList.back())) {
-          auto strideVal = loadOpUser.getIndices()[0];
-          if (strideVal == reinterpretOp.getOffsets()[0])
-            ++newUsedNum;
-        } else if (auto castOp =
-                       mlir::dyn_cast<mlir::memref::CastOp>(eraseList.back()))
-          ++newUsedNum;
+    auto matchesRCOffset = [&](mlir::Value idx) -> bool {
+      if (auto reinterpretOp = mlir::dyn_cast<mlir::memref::ReinterpretCastOp>(
+              eraseList.back())) {
+        auto mixed = reinterpretOp.getMixedOffsets();
+        if (mixed.empty())
+          return false;
+        if (auto dynVal =
+                llvm::dyn_cast_if_present<mlir::Value>(mixed[0]))
+          return idx == dynVal;
+        // Static offset: check that idx is a matching constant.
+        auto intAttr = mlir::cast<mlir::IntegerAttr>(
+            mixed[0].get<mlir::Attribute>());
+        if (auto cst = idx.getDefiningOp<mlir::arith::ConstantIndexOp>())
+          return cst.value() == intAttr.getInt();
+        return false;
       }
+      if (mlir::dyn_cast<mlir::memref::CastOp>(eraseList.back()))
+        return true;
+      return false;
+    };
+
+    if (auto loadOpUser = mlir::dyn_cast_or_null<mlir::memref::LoadOp>(*user)) {
+      if (!loadOpUser.getIndices().empty())
+        if (matchesRCOffset(loadOpUser.getIndices()[0]))
+          ++newUsedNum;
     } else if (auto storeOpUser =
                    mlir::dyn_cast_or_null<mlir::memref::StoreOp>(*user)) {
-      if (!storeOpUser.getIndices().empty()) {
-        if (auto reinterpretOp =
-                mlir::dyn_cast<mlir::memref::ReinterpretCastOp>(
-                    eraseList.back())) {
-          auto strideVal = storeOpUser.getIndices()[0];
-          if (strideVal == reinterpretOp.getOffsets()[0])
-            ++newUsedNum;
-        } else if (auto castOp =
-                       mlir::dyn_cast<mlir::memref::CastOp>(eraseList.back()))
+      if (!storeOpUser.getIndices().empty())
+        if (matchesRCOffset(storeOpUser.getIndices()[0]))
           ++newUsedNum;
-      }
     }
   }
   // If all load/store ops are using forwarded offsets from the current
@@ -1560,12 +1578,20 @@ public:
           rewriter, loc, llvm::cast<mlir::MemRefType>(svType), src, svOffsets,
           svSizes, svStrides);
 
+      // Build sizes: use the computed Value for dynamic dims, attr for static.
       llvm::SmallVector<mlir::OpFoldResult> rcSizes, rcStrides;
-      if (mlir::failed(prepareReinterpretMetadata(newDstType, rewriter, rcSizes,
-                                                  rcStrides, op.getOperation())))
-        return mlir::failure();
+      for (int64_t dim : newDstType.getShape())
+        rcSizes.push_back(mlir::ShapedType::isDynamic(dim)
+                              ? mlir::OpFoldResult(size)
+                              : rewriter.getIndexAttr(dim));
+      llvm::SmallVector<int64_t, 4> strideVals;
+      int64_t layoutOff;
+      (void)newDstType.getStridesAndOffset(strideVals, layoutOff);
+      for (int64_t s : strideVals)
+        rcStrides.push_back(rewriter.getIndexAttr(s));
+
       rewriter.replaceOpWithNewOp<mlir::memref::ReinterpretCastOp>(
-          op, newDstType, sv.getResult(), mlir::OpFoldResult(zero), rcSizes,
+          op, newDstType, sv.getResult(), rewriter.getIndexAttr(0), rcSizes,
           rcStrides);
       return mlir::success();
     }
@@ -1701,11 +1727,18 @@ class CIRGetElementOpLowering
         svOffsets, svSizes, svStrides);
 
     llvm::SmallVector<mlir::OpFoldResult> rcSizes, rcStrides;
-    if (mlir::failed(prepareReinterpretMetadata(dstType, rewriter, rcSizes,
-                                                rcStrides, op.getOperation())))
-      return mlir::failure();
+    for (int64_t dim : dstType.getShape())
+      rcSizes.push_back(mlir::ShapedType::isDynamic(dim)
+                            ? mlir::OpFoldResult(one)
+                            : rewriter.getIndexAttr(dim));
+    llvm::SmallVector<int64_t, 4> strideVals;
+    int64_t layoutOff;
+    (void)dstType.getStridesAndOffset(strideVals, layoutOff);
+    for (int64_t s : strideVals)
+      rcStrides.push_back(rewriter.getIndexAttr(s));
+
     rewriter.replaceOpWithNewOp<mlir::memref::ReinterpretCastOp>(
-        op, dstType, sv.getResult(), mlir::OpFoldResult(zero), rcSizes,
+        op, dstType, sv.getResult(), rewriter.getIndexAttr(0), rcSizes,
         rcStrides);
 
     return mlir::success();
@@ -1789,13 +1822,19 @@ public:
         rewriter, loc, llvm::cast<mlir::MemRefType>(svType), base, svOffsets,
         svSizes, svStrides);
 
-    mlir::Value zero = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
     llvm::SmallVector<mlir::OpFoldResult> rcSizes, rcStrides;
-    if (mlir::failed(prepareReinterpretMetadata(memrefType, rewriter, rcSizes,
-                                                rcStrides, op.getOperation())))
-      return mlir::failure();
+    for (int64_t dim : memrefType.getShape())
+      rcSizes.push_back(mlir::ShapedType::isDynamic(dim)
+                            ? mlir::OpFoldResult(remaining)
+                            : rewriter.getIndexAttr(dim));
+    llvm::SmallVector<int64_t, 4> strideVals;
+    int64_t layoutOff;
+    (void)memrefType.getStridesAndOffset(strideVals, layoutOff);
+    for (int64_t s : strideVals)
+      rcStrides.push_back(rewriter.getIndexAttr(s));
+
     rewriter.replaceOpWithNewOp<mlir::memref::ReinterpretCastOp>(
-        op, memrefType, sv.getResult(), mlir::OpFoldResult(zero), rcSizes,
+        op, memrefType, sv.getResult(), rewriter.getIndexAttr(0), rcSizes,
         rcStrides);
 
     return mlir::success();
@@ -1870,11 +1909,23 @@ public:
     auto resultMemref =
         llvm::cast<mlir::MemRefType>(convertTy(op.getType()));
     llvm::SmallVector<mlir::OpFoldResult> rcSizes, rcStrides;
-    if (mlir::failed(prepareReinterpretMetadata(resultMemref, rewriter, rcSizes,
-                                                rcStrides, op.getOperation())))
-      return mlir::failure();
+    // Dim 0 may be dynamic (use `remaining`); higher dims are static.
+    for (auto [d, dim] : llvm::enumerate(resultMemref.getShape())) {
+      if (mlir::ShapedType::isDynamic(dim))
+        rcSizes.push_back(d == 0 ? mlir::OpFoldResult(remaining)
+                                 : mlir::OpFoldResult(
+                                       mlir::memref::DimOp::create(
+                                           rewriter, loc, sv, (int64_t)d)));
+      else
+        rcSizes.push_back(rewriter.getIndexAttr(dim));
+    }
+    llvm::SmallVector<int64_t, 4> strideVals;
+    int64_t layoutOff;
+    (void)resultMemref.getStridesAndOffset(strideVals, layoutOff);
+    for (int64_t s : strideVals)
+      rcStrides.push_back(rewriter.getIndexAttr(s));
     rewriter.replaceOpWithNewOp<mlir::memref::ReinterpretCastOp>(
-        op, resultMemref, sv.getResult(), mlir::OpFoldResult(zero), rcSizes,
+        op, resultMemref, sv.getResult(), rewriter.getIndexAttr(0), rcSizes,
         rcStrides);
     return mlir::success();
   }

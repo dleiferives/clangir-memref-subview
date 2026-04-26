@@ -74,6 +74,29 @@ using namespace llvm;
 
 namespace cir {
 
+// Mirrors cir::direct::convertLinkage from DirectToLLVM. Kept local here so
+// the ThroughMLIR lowering does not need to pull in DirectToLLVM's internals
+// just to emit an `llvm.mlir.global` for an opaque-pointer global.
+static mlir::LLVM::Linkage
+convertCIRLinkageToLLVMForMLIR(cir::GlobalLinkageKind linkage) {
+  using CIR = cir::GlobalLinkageKind;
+  using L = mlir::LLVM::Linkage;
+  switch (linkage) {
+  case CIR::AppendingLinkage:         return L::Appending;
+  case CIR::AvailableExternallyLinkage: return L::AvailableExternally;
+  case CIR::CommonLinkage:            return L::Common;
+  case CIR::ExternalLinkage:          return L::External;
+  case CIR::ExternalWeakLinkage:      return L::ExternWeak;
+  case CIR::InternalLinkage:          return L::Internal;
+  case CIR::LinkOnceAnyLinkage:       return L::Linkonce;
+  case CIR::LinkOnceODRLinkage:       return L::LinkonceODR;
+  case CIR::PrivateLinkage:           return L::Private;
+  case CIR::WeakAnyLinkage:           return L::Weak;
+  case CIR::WeakODRLinkage:           return L::WeakODR;
+  }
+  llvm_unreachable("unhandled cir::GlobalLinkageKind");
+}
+
 // Convert a memref value to an !llvm.ptr by extracting its aligned pointer.
 static mlir::Value memrefToLLVMPtr(mlir::OpBuilder &builder, mlir::Location loc,
                                    mlir::Value memrefVal) {
@@ -246,19 +269,35 @@ public:
       }
 
       // General handler for extern variadic calls (fprintf, polybench timers,
-      // etc.).  Look up the original cir.func to check isVarArg before it gets
-      // replaced by llvm.func.
+      // etc.). The callee may still be a cir.func (if visited before
+      // CIRFuncOpLowering) or already rewritten to an llvm.func; handle both.
       if (auto callee = op.getCallee()) {
         auto parentModule = op->getParentOfType<mlir::ModuleOp>();
+        bool isVarArg = false;
+        cir::FuncType cirFnType;
         if (auto cirFn = parentModule.lookupSymbol<cir::FuncOp>(*callee)) {
-          if (cirFn.getFunctionType().isVarArg()) {
-            auto *context = rewriter.getContext();
-            auto llvmPtrTy = mlir::LLVM::LLVMPointerType::get(context);
-            auto cirFnType = cirFn.getFunctionType();
+          cirFnType = cirFn.getFunctionType();
+          isVarArg = cirFnType.isVarArg();
+        } else if (auto llvmFn =
+                       parentModule.lookupSymbol<mlir::LLVM::LLVMFuncOp>(
+                           *callee)) {
+          isVarArg = llvmFn.isVarArg();
+        }
+        if (isVarArg) {
+          auto *context = rewriter.getContext();
+          auto llvmPtrTy = mlir::LLVM::LLVMPointerType::get(context);
 
             // Rebuild LLVM function type (mirrors CIRFuncOpLowering logic).
+            // When the original cir.func is already gone we fall back to
+            // building the signature from the call's operand/result types,
+            // since they carry the same information for the C ABI.
             SmallVector<mlir::Type> llvmParams;
-            for (auto paramType : cirFnType.getInputs()) {
+            auto paramTypes = cirFnType
+                                  ? cirFnType.getInputs()
+                                  : mlir::ArrayRef<mlir::Type>(
+                                        op.getOperandTypes().begin(),
+                                        op.getOperandTypes().end());
+            for (auto paramType : paramTypes) {
               auto converted = typeConverter->convertType(paramType);
               if (!converted)
                 return mlir::failure();
@@ -267,7 +306,10 @@ public:
                                        : llvmPtrTy);
             }
             mlir::Type retType;
-            auto cirRetType = cirFnType.getReturnType();
+            mlir::Type cirRetType =
+                cirFnType ? cirFnType.getReturnType() : mlir::Type{};
+            if (!cirRetType && op.getNumResults() > 0)
+              cirRetType = op.getResult(0).getType();
             if (!cirRetType || isa<cir::VoidType>(cirRetType))
               retType = mlir::LLVM::LLVMVoidType::get(context);
             else {
@@ -352,7 +394,6 @@ public:
             for (auto *deadOp : llvm::reverse(toErase))
               rewriter.eraseOp(deadOp);
             return mlir::LogicalResult::success();
-          }
         }
       }
 
@@ -361,8 +402,70 @@ public:
       return mlir::LogicalResult::success();
 
     } else {
-      // TODO: support lowering of indirect calls via func.call_indirect op
-      return op.emitError() << "lowering of indirect calls not supported yet";
+      // Indirect call. The first CIR operand is the function pointer; the
+      // rest are the call arguments. After type conversion the function
+      // pointer is expected to be `!llvm.ptr` (the PointerType converter
+      // falls back to that for `!cir.ptr<!cir.func<...>>`). Emit `llvm.call`
+      // with the pointer as the callee.
+      //
+      // This path handles both fixed-arity and variadic callees (e.g.
+      // polybench's `no_proto` timer functions).
+      auto operands = adaptor.getOperands();
+      if (operands.empty())
+        return op.emitError() << "indirect call with no callee operand";
+      mlir::Value callee = operands.front();
+      auto calleeTy = callee.getType();
+      if (!mlir::isa<mlir::LLVM::LLVMPointerType>(calleeTy))
+        return op.emitError()
+               << "indirect call callee expected to be !llvm.ptr after "
+                  "conversion, got "
+               << calleeTy;
+
+      // Recover the LLVM function type from the original CIR pointer-to-func
+      // operand. `op.getOperand(0)` is the pre-conversion function pointer.
+      auto cirCalleeTy =
+          mlir::dyn_cast<cir::PointerType>(op.getOperand(0).getType());
+      if (!cirCalleeTy)
+        return op.emitError() << "indirect callee is not a cir.ptr";
+      auto cirFnTy = mlir::dyn_cast<cir::FuncType>(cirCalleeTy.getPointee());
+      if (!cirFnTy)
+        return op.emitError() << "indirect callee does not point to a func";
+
+      auto *context = rewriter.getContext();
+      auto llvmPtrTy = mlir::LLVM::LLVMPointerType::get(context);
+
+      SmallVector<mlir::Type> llvmParams;
+      for (auto paramType : cirFnTy.getInputs()) {
+        auto converted = typeConverter->convertType(paramType);
+        if (!converted)
+          return mlir::failure();
+        llvmParams.push_back(mlir::LLVM::isCompatibleType(converted)
+                                 ? converted
+                                 : llvmPtrTy);
+      }
+      mlir::Type retType;
+      auto cirRetType = cirFnTy.getReturnType();
+      if (!cirRetType || mlir::isa<cir::VoidType>(cirRetType))
+        retType = mlir::LLVM::LLVMVoidType::get(context);
+      else {
+        auto converted = typeConverter->convertType(cirRetType);
+        retType = (converted && mlir::LLVM::isCompatibleType(converted))
+                      ? converted
+                      : mlir::LLVM::LLVMVoidType::get(context);
+      }
+      auto llvmFnType = mlir::LLVM::LLVMFunctionType::get(
+          retType, llvmParams, /*isVarArg=*/cirFnTy.isVarArg());
+
+      // For an indirect LLVM::CallOp the function pointer is the first entry
+      // in the operand list and the callee symbol attribute is null.
+      SmallVector<mlir::Value> allOperands;
+      allOperands.reserve(operands.size());
+      allOperands.push_back(callee);
+      allOperands.append(operands.begin() + 1, operands.end());
+
+      rewriter.replaceOpWithNewOp<mlir::LLVM::CallOp>(
+          op, llvmFnType, mlir::FlatSymbolRefAttr{}, allOperands);
+      return mlir::success();
     }
   }
 };
@@ -600,6 +703,21 @@ public:
   mlir::LogicalResult
   matchAndRewrite(cir::LoadOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
+    // If the address operand is an opaque LLVM pointer (e.g. loading from
+    // `llvm.mlir.addressof @stderr`), we cannot use memref.load; emit an
+    // LLVM-dialect load instead. The result type is whatever the type
+    // converter produced for the load's CIR result (typically !llvm.ptr
+    // again for `FILE **` → `FILE *`).
+    if (mlir::isa<mlir::LLVM::LLVMPointerType>(adaptor.getAddr().getType())) {
+      mlir::Type resultType =
+          getTypeConverter()->convertType(op.getResult().getType());
+      if (!resultType)
+        return mlir::failure();
+      rewriter.replaceOpWithNewOp<mlir::LLVM::LoadOp>(op, resultType,
+                                                      adaptor.getAddr());
+      return mlir::success();
+    }
+
     mlir::Value base;
     SmallVector<mlir::Value> indices;
     SmallVector<mlir::Operation *> eraseList;
@@ -625,6 +743,15 @@ public:
   mlir::LogicalResult
   matchAndRewrite(cir::StoreOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
+    // Symmetric to CIRLoadOpLowering: if storing through an opaque LLVM
+    // pointer, emit llvm.store rather than memref.store.
+    if (mlir::isa<mlir::LLVM::LLVMPointerType>(adaptor.getAddr().getType())) {
+      mlir::Value value = emitToMemory(rewriter, op, adaptor.getValue());
+      rewriter.replaceOpWithNewOp<mlir::LLVM::StoreOp>(op, value,
+                                                       adaptor.getAddr());
+      return mlir::success();
+    }
+
     mlir::Value base;
     SmallVector<mlir::Value> indices;
     SmallVector<mlir::Operation *> eraseList;
@@ -1379,6 +1506,36 @@ public:
     auto convertedType = convertTypeForMemory(*getTypeConverter(), CIRSymType);
     if (!convertedType)
       return mlir::failure();
+
+    // If the converted element type cannot be stored in a memref (e.g.
+    // !llvm.ptr produced by the PointerType converter's fallback for
+    // pointer-to-struct types like `extern FILE *stderr`), emit an
+    // LLVM-dialect global instead. This mirrors DirectToLLVM's handling of
+    // the same case. We only support the declaration (no initializer) path
+    // here, which is what arises for external globals such as `stderr`;
+    // globals with non-memref element types AND a non-trivial initializer
+    // would need the full DirectToLLVM initializer-region machinery, which
+    // is out of scope for this pass.
+    if (!mlir::MemRefType::isValidElementType(convertedType)) {
+      if (op.getInitialValue().has_value()) {
+        op.emitOpError("cir-to-mlir: global with non-memref element type "
+                       "and a non-trivial initializer is not yet supported");
+        return mlir::failure();
+      }
+      rewriter.replaceOpWithNewOp<mlir::LLVM::GlobalOp>(
+          op, convertedType,
+          /*isConstant=*/op.getConstant(),
+          convertCIRLinkageToLLVMForMLIR(op.getLinkage()),
+          op.getSymName(),
+          /*value=*/mlir::Attribute{},
+          /*alignment=*/op.getAlignment().value_or(0),
+          /*addrSpace=*/0,
+          /*dsoLocal=*/op.getDsoLocal(),
+          /*threadLocal=*/(bool)op.getTlsModelAttr(),
+          /*comdat=*/mlir::SymbolRefAttr{});
+      return mlir::success();
+    }
+
     auto memrefType = mlir::dyn_cast<mlir::MemRefType>(convertedType);
     if (!memrefType) {
       auto maybeAddrSpace = getTypeConverter()->convertTypeAttribute(
@@ -1417,18 +1574,20 @@ public:
           auto elementType = memrefType.getElementType();
           auto rtt =
               mlir::RankedTensorType::get(memrefType.getShape(), elementType);
-          if (mlir::isa<mlir::IntegerType>(elementType))
-            initialValue = mlir::DenseIntElementsAttr::get(rtt, 0);
-          else if (mlir::isa<mlir::FloatType>(elementType)) {
+          if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(elementType)) {
+            initialValue = mlir::DenseIntElementsAttr::get(
+                rtt, llvm::APInt(intTy.getWidth(), 0));
+          } else if (mlir::isa<mlir::FloatType>(elementType)) {
             auto floatZero = mlir::FloatAttr::get(elementType, 0.0).getValue();
             initialValue = mlir::DenseFPElementsAttr::get(rtt, floatZero);
           } else
             initialValue = mlir::Attribute();
         } else {
           auto rtt = mlir::RankedTensorType::get({1}, convertedType);
-          if (mlir::isa<mlir::IntegerType>(convertedType))
-            initialValue = mlir::DenseIntElementsAttr::get(rtt, 0);
-          else if (mlir::isa<mlir::FloatType>(convertedType)) {
+          if (auto intTy = mlir::dyn_cast<mlir::IntegerType>(convertedType)) {
+            initialValue = mlir::DenseIntElementsAttr::get(
+                rtt, llvm::APInt(intTy.getWidth(), 0));
+          } else if (mlir::isa<mlir::FloatType>(convertedType)) {
             auto floatZero =
                 mlir::FloatAttr::get(convertedType, 0.0).getValue();
             initialValue = mlir::DenseFPElementsAttr::get(rtt, floatZero);
@@ -1478,11 +1637,28 @@ public:
       rewriter.eraseOp(op);
       return mlir::success();
     }
+    auto resultType = getTypeConverter()->convertType(op.getType());
+    if (!resultType)
+      return mlir::failure();
+
+    // If the get_global result is an !llvm.ptr — either because the
+    // referenced global has a non-memref element type (e.g.
+    // `stderr : !cir.ptr<!rec__IO_FILE>`), or because the referenced symbol
+    // is a function (e.g. `@polybench_timer_start` lowered to `llvm.func`) —
+    // emit `llvm.mlir.addressof` rather than `memref.get_global`. This must
+    // come before the `convertTypeForMemory` check on the pointee, which
+    // returns null for non-storage types like `cir::FuncType`.
+    if (mlir::isa<mlir::LLVM::LLVMPointerType>(resultType)) {
+      rewriter.replaceOpWithNewOp<mlir::LLVM::AddressOfOp>(op, resultType,
+                                                           op.getName());
+      return mlir::success();
+    }
+
     auto globalOpType =
         convertTypeForMemory(*getTypeConverter(), op.getType().getPointee());
     if (!globalOpType)
       return mlir::failure();
-    auto resultType = getTypeConverter()->convertType(op.getType());
+
     auto memrefType = mlir::dyn_cast<mlir::MemRefType>(globalOpType);
     if (!memrefType) {
       mlir::MemRefType resultTypeMemref =
@@ -1831,6 +2007,57 @@ public:
       else
         rewriter.replaceOpWithNewOp<mlir::arith::FPToUIOp>(op, newDstType, src);
       return mlir::success();
+    }
+    case CIR::bitcast: {
+      // Pointer bitcasts. Three shapes arise in practice once !llvm.ptr is
+      // produced by the PointerType converter fallback:
+      //   1. !llvm.ptr -> !llvm.ptr  (no-op: LLVM pointers are opaque).
+      //   2. memref<...> -> !llvm.ptr  (e.g. `free((void*)array)`): extract
+      //      the aligned base pointer via memrefToLLVMPtr.
+      //   3. !llvm.ptr -> memref<...>: not expected for the current inputs;
+      //      reject explicitly so we fail loudly rather than produce an
+      //      unresolved materialization.
+      auto newDstType = convertTy(dstType);
+      auto srcType = src.getType();
+      if (!newDstType)
+        return mlir::failure();
+      if (mlir::isa<mlir::LLVM::LLVMPointerType>(newDstType) &&
+          mlir::isa<mlir::LLVM::LLVMPointerType>(srcType)) {
+        rewriter.replaceOp(op, src);
+        return mlir::success();
+      }
+      if (mlir::isa<mlir::LLVM::LLVMPointerType>(newDstType) &&
+          mlir::isa<mlir::MemRefType>(srcType)) {
+        mlir::Value ptrVal = memrefToLLVMPtr(rewriter, op.getLoc(), src);
+        rewriter.replaceOp(op, ptrVal);
+        return mlir::success();
+      }
+      if (mlir::isa<mlir::MemRefType>(newDstType) &&
+          mlir::isa<mlir::MemRefType>(srcType)) {
+        // Same-shape memref bitcasts (e.g. typed-ptr casts that survived
+        // into CIR). memref.cast only permits compatible layouts; if types
+        // already match, just forward.
+        if (srcType == newDstType) {
+          rewriter.replaceOp(op, src);
+          return mlir::success();
+        }
+        rewriter.replaceOpWithNewOp<mlir::memref::CastOp>(op, newDstType, src);
+        return mlir::success();
+      }
+      // !llvm.ptr -> memref<...> : arises when a C function returns `void *`
+      // (e.g. `polybench_alloc_data`) and the CIR bitcast narrows the result
+      // to a typed pointer. We cannot faithfully rebuild a memref descriptor
+      // without shape/stride info, so bridge with an unrealized conversion
+      // cast. The cast is legal in the target, and the eventual LLVM
+      // lowering materialises the underlying descriptor.
+      if (mlir::isa<mlir::MemRefType>(newDstType) &&
+          mlir::isa<mlir::LLVM::LLVMPointerType>(srcType)) {
+        rewriter.replaceOpWithNewOp<mlir::UnrealizedConversionCastOp>(
+            op, newDstType, src);
+        return mlir::success();
+      }
+      return op.emitError() << "bitcast lowering from " << srcType << " to "
+                            << newDstType << " not supported";
     }
     default:
       break;
@@ -2253,9 +2480,20 @@ static mlir::TypeConverter prepareTypeConverter() {
     if (!ty)
       // Fallback for unconvertible pointee types (structs, void*, etc.):
       // use an opaque LLVM pointer so calls with FILE* etc. can proceed.
+      // TODO: this fallback leaks !llvm.ptr into contexts that cannot accept
+      // it (e.g. memref-world globals). CIRGlobalOpLowering and
+      // CIRGetGlobalOpLowering branch on this and emit llvm.mlir.global /
+      // llvm.mlir.addressof instead; a cleaner fix would confine !llvm.ptr
+      // production to variadic/call boundaries via type materializations.
       return mlir::LLVM::LLVMPointerType::get(type.getContext());
     if (isa<cir::ArrayType>(type.getPointee()))
       return ty;
+    // If the converted pointee is itself not a valid memref element type
+    // (e.g. !llvm.ptr produced recursively for pointer-to-struct-pointer
+    // like `FILE **`), fall back to an opaque LLVM pointer rather than
+    // asserting inside MemRefType::get.
+    if (!mlir::MemRefType::isValidElementType(ty))
+      return mlir::LLVM::LLVMPointerType::get(type.getContext());
     auto maybeAddrSpace =
         converter.convertTypeAttribute(type, type.getAddrSpace());
     mlir::Attribute addrSpace = maybeAddrSpace.value_or(mlir::Attribute());
@@ -2348,6 +2586,11 @@ void ConvertCIRToMLIRPass::runOnOperation() {
 
   mlir::ConversionTarget target(getContext());
   target.addLegalOp<mlir::ModuleOp>();
+  // Unrealized conversion casts are used as explicit bridges between the
+  // memref world and !llvm.ptr at C-ABI boundaries (e.g. void*-returning
+  // allocators); mark them legal so partial conversion does not treat them
+  // as unresolved materializations.
+  target.addLegalOp<mlir::UnrealizedConversionCastOp>();
   target
       .addLegalDialect<mlir::affine::AffineDialect, mlir::arith::ArithDialect,
                        mlir::memref::MemRefDialect, mlir::func::FuncDialect,

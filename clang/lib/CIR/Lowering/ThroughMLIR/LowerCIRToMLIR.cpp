@@ -292,11 +292,12 @@ public:
             // building the signature from the call's operand/result types,
             // since they carry the same information for the C ABI.
             SmallVector<mlir::Type> llvmParams;
-            auto paramTypes = cirFnType
-                                  ? cirFnType.getInputs()
-                                  : mlir::ArrayRef<mlir::Type>(
-                                        op.getOperandTypes().begin(),
-                                        op.getOperandTypes().end());
+            SmallVector<mlir::Type> paramTypesStorage;
+            if (cirFnType)
+              llvm::append_range(paramTypesStorage, cirFnType.getInputs());
+            else
+              llvm::append_range(paramTypesStorage, op.getOperandTypes());
+            mlir::ArrayRef<mlir::Type> paramTypes = paramTypesStorage;
             for (auto paramType : paramTypes) {
               auto converted = typeConverter->convertType(paramType);
               if (!converted)
@@ -309,7 +310,7 @@ public:
             mlir::Type cirRetType =
                 cirFnType ? cirFnType.getReturnType() : mlir::Type{};
             if (!cirRetType && op.getNumResults() > 0)
-              cirRetType = op.getResult(0).getType();
+              cirRetType = op->getResult(0).getType();
             if (!cirRetType || isa<cir::VoidType>(cirRetType))
               retType = mlir::LLVM::LLVMVoidType::get(context);
             else {

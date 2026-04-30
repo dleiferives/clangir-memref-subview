@@ -55,6 +55,13 @@ cir-opt-debug: configure-debug
 clang: $(BUILD_DIR)/build.ninja
 	ninja -C $(BUILD_DIR) clang
 
+
+opt: $(BUILD_DIR)/build.ninja
+	ninja -C $(BUILD_DIR) clang
+
+llc: $(BUILD_DIR)/build.ninja
+	ninja -C $(BUILD_DIR) clang
+
 mlir-opt: $(BUILD_DIR)/build.ninja
 	ninja -C $(BUILD_DIR) mlir-opt
 

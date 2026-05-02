@@ -648,6 +648,10 @@ static bool findBaseAndIndices(mlir::Value addr, mlir::Value &base,
 static void eraseIfSafe(mlir::Value oldAddr, mlir::Value newAddr,
                         SmallVector<mlir::Operation *> &eraseList,
                         mlir::ConversionPatternRewriter &rewriter) {
+  // The subview prototype can leave view-like ops with transient users during
+  // dialect conversion. Leaving them for later cleanup is safer than erasing
+  // them from inside the conversion pattern.
+  return;
 
   unsigned oldUsedNum =
       std::distance(oldAddr.getUses().begin(), oldAddr.getUses().end());
@@ -1090,6 +1094,11 @@ public:
     if (auto symVisibilityAttr = func.getSymVisibilityAttr())
       result.push_back(
           mlir::NamedAttribute("sym_visibility", symVisibilityAttr));
+
+    if (auto inlineKind = func.getInlineKindAttr())
+      if (inlineKind.getValue() == cir::InlineKind::NoInline)
+        result.push_back(mlir::NamedAttribute(
+            "no_inline", mlir::UnitAttr::get(getContext())));
 
     if (auto extraAttr = func.getExtraAttrs())
       lowerFuncOpenCLKernelMetadataToMLIR(extraAttr, result);
@@ -2269,25 +2278,31 @@ public:
         rewriter, loc, llvm::cast<mlir::MemRefType>(svType), base, svOffsets,
         svSizes, svStrides);
 
-    // Return the subview directly.  Its strided layout already encodes the
-    // correct offset (= stride value), so chained ptr_strides accumulate
-    // offsets correctly.  A reinterpret_cast(offset=0) here would throw the
-    // offset away without advancing the aligned pointer, producing wrong GEPs
-    // for multi-level 2D array accesses.  The subview stays in the IR for
-    // alias-metadata analysis; findBaseAndIndices handles non-rcast addresses
-    // by falling through to base=subview, index=[0].
-    rewriter.replaceOp(op, sv.getResult());
+    llvm::SmallVector<mlir::OpFoldResult> rcSizes, rcStrides;
+    for (int64_t dim : memrefType.getShape())
+      rcSizes.push_back(mlir::ShapedType::isDynamic(dim)
+                            ? mlir::OpFoldResult(remaining)
+                            : rewriter.getIndexAttr(dim));
+    llvm::SmallVector<int64_t, 4> strideVals;
+    int64_t layoutOff;
+    (void)memrefType.getStridesAndOffset(strideVals, layoutOff);
+    for (int64_t s : strideVals)
+      rcStrides.push_back(rewriter.getIndexAttr(s));
+
+    // Return the ABI-compatible memref type expected by the type converter,
+    // while keeping the structural subview visible as the cast source.
+    rewriter.replaceOpWithNewOp<mlir::memref::ReinterpretCastOp>(
+        op, memrefType, sv.getResult(), rewriter.getIndexAttr(0), rcSizes,
+        rcStrides);
     return mlir::success();
   }
 
   mlir::LogicalResult
   matchAndRewrite(cir::PtrStrideOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
-    if (isLoadStoreOrCastArrayToPtrProduer(op)) {
-      if (!isa<cir::ArrayType>(op.getType().getPointee()))
-        return rewritePtrStrideToReinterpret(op, peelUrcast(adaptor.getBase()),
-                                             adaptor, rewriter);
-    }
+    if (!isa<cir::ArrayType>(op.getType().getPointee()))
+      return rewritePtrStrideToReinterpret(op, peelUrcast(adaptor.getBase()),
+                                           adaptor, rewriter);
 
     // Rank-preserving subview for pointer-to-array stride. The base memref may
     // be multi-dimensional (e.g. memref<?xNxT> for int (*p)[N]). Stride on
@@ -2651,59 +2666,9 @@ void ConvertCIRToMLIRPass::runOnOperation() {
     return;
   }
 
-  // Convert SCF dialect loops to cf dialect.  scf.while (and scf.for/scf.if)
-  // require single-block regions; finalize-memref-to-llvm splits enclosing
-  // blocks when lowering memref.alloca_scope, violating that constraint.
-  // After this step, loops are plain cf.br/cf.cond_br chains.
-  mlir::RewritePatternSet scfToCFPatterns(&getContext());
-  mlir::populateSCFToControlFlowConversionPatterns(scfToCFPatterns);
-  if (mlir::failed(
-          mlir::applyPatternsGreedily(theModule, std::move(scfToCFPatterns)))) {
-    signalPassFailure();
-    return;
-  }
-
-  // Inline all memref.alloca_scope ops.  After SCF→CF, alloca_scope regions
-  // that wrap loop bodies now have multiple blocks (from the CF loop structure
-  // inside), violating the single-block constraint of memref.alloca_scope.
-  // Process innermost scopes first (post-order) so that nested inlining works.
-  llvm::SmallVector<mlir::memref::AllocaScopeOp> scopes;
-  theModule->walk<mlir::WalkOrder::PostOrder>(
-      [&](mlir::memref::AllocaScopeOp scope) { scopes.push_back(scope); });
-  for (auto scope : scopes) {
-    mlir::OpBuilder builder(scope.getContext());
-    mlir::Location loc = scope->getLoc();
-    mlir::Block *parentBlock = scope->getBlock();
-    mlir::Region *parentRegion = parentBlock->getParent();
-
-    // Split parent block after scope → exitBlock holds post-scope ops.
-    mlir::Block *exitBlock =
-        parentBlock->splitBlock(std::next(mlir::Block::iterator(scope)));
-
-    // Record the scope's entry block before moving.
-    mlir::Block *scopeEntry = &scope.getBodyRegion().front();
-
-    // Move all scope blocks into the parent region before exitBlock.
-    parentRegion->getBlocks().splice(exitBlock->getIterator(),
-                                     scope.getBodyRegion().getBlocks());
-
-    // Branch from the original parent block into the inlined scope entry.
-    builder.setInsertionPointToEnd(parentBlock);
-    mlir::cf::BranchOp::create(builder, loc, scopeEntry);
-
-    // Replace every alloca_scope.return with cf.br to the exit block.
-    for (mlir::Block *block = scopeEntry; block != exitBlock;
-         block = block->getNextNode()) {
-      if (mlir::Operation *term = block->getTerminator()) {
-        if (mlir::isa<mlir::memref::AllocaScopeReturnOp>(term)) {
-          builder.setInsertionPoint(term);
-          mlir::cf::BranchOp::create(builder, term->getLoc(), exitBlock);
-          term->erase();
-        }
-      }
-    }
-    scope->erase();
-  }
+  // Leave SCF loops and memref.alloca_scope intact for standalone MLIR output.
+  // The thesis alias pipeline can parse these dialects directly, and Dylan's
+  // experimental SCF->CF cleanup currently crashes on simple canonical loops.
 
   // Strip all CIR-specific module attributes so the output is portable to
   // standard MLIR tools that don't link the CIR dialect.

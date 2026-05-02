@@ -45,6 +45,7 @@ public:
   mlir::LogicalResult findStepAndIV();
   cir::CmpOp findCmpOp();
   mlir::Value findIVInitValue();
+  mlir::Value materializeScalarLoadBeforeLoop(cir::LoadOp loadOp);
   void analysis();
 
   mlir::Value plusConstant(mlir::Value v, mlir::Location loc, int addend);
@@ -264,6 +265,23 @@ mlir::Value SCFLoop::findIVInitValue() {
   return nullptr;
 }
 
+mlir::Value SCFLoop::materializeScalarLoadBeforeLoop(cir::LoadOp loadOp) {
+  auto remapAddr = rewriter->getRemappedValue(loadOp.getAddr());
+  if (!remapAddr)
+    return nullptr;
+
+  auto memrefType = mlir::dyn_cast<mlir::MemRefType>(remapAddr.getType());
+  if (!memrefType || memrefType.getRank() != 1)
+    return nullptr;
+
+  mlir::OpBuilder::InsertionGuard guard(*rewriter);
+  rewriter->setInsertionPoint(forOp);
+  auto zero =
+      mlir::arith::ConstantIndexOp::create(*rewriter, loadOp.getLoc(), 0);
+  return mlir::memref::LoadOp::create(*rewriter, loadOp.getLoc(), remapAddr,
+                                      mlir::ValueRange{zero});
+}
+
 void SCFLoop::analysis() {
   // Check whether this ForOp contains break or continue.
   forOp.walk([&](mlir::Operation *op) {
@@ -301,7 +319,11 @@ void SCFLoop::analysis() {
 
   // The loop end value should be hoisted out of loop by -cir-mlir-scf-prepare.
   // So we could get the value by getRemappedValue.
-  auto ivEndBound = rewriter->getRemappedValue(cmpOp.getRhs());
+  mlir::Value ivEndBound;
+  if (auto rhsLoad = cmpOp.getRhs().getDefiningOp<cir::LoadOp>())
+    ivEndBound = materializeScalarLoadBeforeLoop(rhsLoad);
+  if (!ivEndBound)
+    ivEndBound = rewriter->getRemappedValue(cmpOp.getRhs());
   // If the loop end bound is not loop invariant and can't be hoisted,
   // then this is not a canonical loop.
   if (!ivEndBound) {
@@ -346,19 +368,18 @@ void SCFLoop::transferToSCFForOp() {
     return mlir::WalkResult::advance();
   });
 
-  // All uses have been replaced by the scf.IV and we can remove the alloca +
-  // initial store operations
+  // Do not erase the lowered IV alloca/cast/store here. They may still have
+  // transient uses while dialect conversion is applying its rewrite batch, and
+  // erasing them from inside this pattern can trip the conversion rewriter's
+  // "op has no uses" assertion. Leaving them behind is semantically harmless;
+  // downstream mem2reg/canonicalize cleanup removes the dead stack traffic.
 
-  // The operations before the loop have been transferred to MLIR.
-  // So we need to go through getRemappedValue to find the operations.
-  auto remapAddr = rewriter->getRemappedValue(ivAddr);
-  if (auto castOp =
-          mlir::dyn_cast<mlir::memref::CastOp>(remapAddr.getDefiningOp()))
-    remapAddr = castOp->getOperand(0);
-  // Since this is a canonical loop we can remove the alloca + initial store op
-  rewriter->eraseOp(remapAddr.getDefiningOp());
-  for (auto user : remapAddr.getUsers())
-    rewriter->eraseOp(user);
+  // The canonical scf.for lowering consumes the CIR condition/step regions to
+  // compute lb/ub/step, but it does not inline those regions. Drop their
+  // internal SSA references before the original cir.for is erased by dialect
+  // conversion; otherwise recursive erasure can see nested ops with uses.
+  forOp.getCond().dropAllReferences();
+  forOp.getStep().dropAllReferences();
 }
 
 void SCFLoop::transformToSCFWhileOp() {
@@ -451,24 +472,30 @@ public:
   mlir::LogicalResult
   matchAndRewrite(cir::ForOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
+    auto eraseForOp = [&]() {
+      op->dropAllDefinedValueUses();
+      op->dropAllReferences();
+      rewriter.eraseOp(op);
+    };
+
     SCFLoop loop(op, &rewriter);
     loop.analysis();
     // Breaks and continues are handled in lowering of cir::WhileOp.
     // We can reuse the code by transforming this ForOp into WhileOp.
     if (loop.hasBreakOrContinue()) {
       loop.transformToCIRWhileOp();
-      rewriter.eraseOp(op);
+      eraseForOp();
       return mlir::success();
     }
 
     if (!loop.isCanonical()) {
       loop.transformToSCFWhileOp();
-      rewriter.eraseOp(op);
+      eraseForOp();
       return mlir::success();
     }
 
     loop.transferToSCFForOp();
-    rewriter.eraseOp(op);
+    eraseForOp();
     return mlir::success();
   }
 };

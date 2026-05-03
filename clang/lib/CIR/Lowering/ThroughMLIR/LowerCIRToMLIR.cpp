@@ -16,6 +16,8 @@
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVM.h"
 #include "mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h"
+#include "mlir/Conversion/LLVMCommon/MemRefBuilder.h"
+#include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -52,6 +54,7 @@
 #include "mlir/Target/LLVMIR/Dialect/OpenMP/OpenMPToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
 #include "clang/CIR/Dialect/IR/CIRTypes.h"
 #include "clang/CIR/Interfaces/CIRLoopOpInterface.h"
@@ -543,9 +546,9 @@ public:
     } else {
       auto targetType = mlir::cast<mlir::MemRefType>(
           getTypeConverter()->convertType(op.getResult().getType()));
-      memreftype = mlir::MemRefType::get({1}, targetType.getElementType(),
-                                         targetType.getLayout(),
-                                         targetType.getMemorySpace());
+      memreftype = mlir::MemRefType::get(
+          {1}, targetType.getElementType(),
+          mlir::MemRefLayoutAttrInterface(), targetType.getMemorySpace());
       auto allocaOp = mlir::memref::AllocaOp::create(
           rewriter, op.getLoc(), memreftype, op.getAlignmentAttr());
       // Cast from memref<1xMlirType> to memref<?xMlirType>
@@ -560,12 +563,39 @@ public:
   }
 };
 
-// Find base and indices from memref.reinterpret_cast
-// and put it into eraseList.
+// Peel through a single unrealized_conversion_cast whose operand is a memref.
+// The conversion framework inserts such casts when CIRPtrStrideOpLowering /
+// CIRGetElementOpLowering return a strided subview for a value typed
+// memref<?xT>.  Callers that then produce another subview on top should peel
+// the cast first so the new subview sees the strided base and accumulates
+// offsets correctly.
+static mlir::Value peelUrcast(mlir::Value v) {
+  if (auto cast = v.getDefiningOp<mlir::UnrealizedConversionCastOp>())
+    if (cast->getNumOperands() == 1 &&
+        mlir::isa<mlir::MemRefType>(cast->getOperand(0).getType()))
+      return cast->getOperand(0);
+  return v;
+}
+
+// Find base and indices from memref.reinterpret_cast (or memref.subview for
+// the subview-only ptr_stride pattern) and put ops to erase into eraseList.
 static bool findBaseAndIndices(mlir::Value addr, mlir::Value &base,
                                SmallVector<mlir::Value> &indices,
                                SmallVector<mlir::Operation *> &eraseList,
                                mlir::ConversionPatternRewriter &rewriter) {
+  // Peel through unrealized_conversion_cast inserted by the conversion
+  // framework when CIRPtrStrideOpLowering returns a strided subview for a
+  // value that was typed memref<?xT>.  The cast becomes dead once we bypass
+  // it here; the framework's cleanup removes it.
+  while (auto urcast =
+             addr.getDefiningOp<mlir::UnrealizedConversionCastOp>()) {
+    if (urcast->getNumOperands() != 1 ||
+        !mlir::isa<mlir::MemRefType>(urcast->getOperand(0).getType()))
+      break;
+    eraseList.push_back(urcast);
+    addr = urcast->getOperand(0);
+  }
+
   while (mlir::Operation *addrOp =
              addr.getDefiningOp<mlir::memref::ReinterpretCastOp>()) {
     // Use getMixedOffsets() rather than getOperand(1) so that both static
@@ -618,6 +648,10 @@ static bool findBaseAndIndices(mlir::Value addr, mlir::Value &base,
 static void eraseIfSafe(mlir::Value oldAddr, mlir::Value newAddr,
                         SmallVector<mlir::Operation *> &eraseList,
                         mlir::ConversionPatternRewriter &rewriter) {
+  // The subview prototype can leave view-like ops with transient users during
+  // dialect conversion. Leaving them for later cleanup is safer than erasing
+  // them from inside the conversion pattern.
+  return;
 
   unsigned oldUsedNum =
       std::distance(oldAddr.getUses().begin(), oldAddr.getUses().end());
@@ -1060,6 +1094,11 @@ public:
     if (auto symVisibilityAttr = func.getSymVisibilityAttr())
       result.push_back(
           mlir::NamedAttribute("sym_visibility", symVisibilityAttr));
+
+    if (auto inlineKind = func.getInlineKindAttr())
+      if (inlineKind.getValue() == cir::InlineKind::NoInline)
+        result.push_back(mlir::NamedAttribute(
+            "no_inline", mlir::UnitAttr::get(getContext())));
 
     if (auto extraAttr = func.getExtraAttrs())
       lowerFuncOpenCLKernelMetadataToMLIR(extraAttr, result);
@@ -1664,9 +1703,9 @@ public:
     if (!memrefType) {
       mlir::MemRefType resultTypeMemref =
           mlir::cast<mlir::MemRefType>(resultType);
-      memrefType = mlir::MemRefType::get({1}, resultTypeMemref.getElementType(),
-                                         resultTypeMemref.getLayout(),
-                                         resultTypeMemref.getMemorySpace());
+      memrefType = mlir::MemRefType::get(
+          {1}, resultTypeMemref.getElementType(),
+          mlir::MemRefLayoutAttrInterface(), resultTypeMemref.getMemorySpace());
     }
 
     auto symbol = op.getName();
@@ -2047,14 +2086,60 @@ public:
       }
       // !llvm.ptr -> memref<...> : arises when a C function returns `void *`
       // (e.g. `polybench_alloc_data`) and the CIR bitcast narrows the result
-      // to a typed pointer. We cannot faithfully rebuild a memref descriptor
-      // without shape/stride info, so bridge with an unrealized conversion
-      // cast. The cast is legal in the target, and the eventual LLVM
-      // lowering materialises the underlying descriptor.
+      // to a typed pointer.  Build a real LLVM descriptor struct so that
+      // finalize-memref-to-llvm can extract pointer/size fields properly.
+      // The element count is taken from the first argument of the defining
+      // call (allocation functions like malloc/polybench_alloc_data take the
+      // element count as arg 0); if unavailable we default to 0.
       if (mlir::isa<mlir::MemRefType>(newDstType) &&
           mlir::isa<mlir::LLVM::LLVMPointerType>(srcType)) {
+        auto castLoc = op.getLoc();
+        auto memrefTy = mlir::cast<mlir::MemRefType>(newDstType);
+        auto *ctx = rewriter.getContext();
+
+        // Build the LLVM descriptor type for a rank-1 dynamic memref:
+        //   struct { ptr, ptr, i64, array<rankxi64>, array<rankxi64> }
+        auto ptrTy = mlir::LLVM::LLVMPointerType::get(ctx);
+        auto i64Ty = rewriter.getI64Type();
+        auto arrayTy = mlir::LLVM::LLVMArrayType::get(
+            i64Ty, static_cast<unsigned>(memrefTy.getRank()));
+        auto descTy = mlir::LLVM::LLVMStructType::getLiteral(
+            ctx, {ptrTy, ptrTy, i64Ty, arrayTy, arrayTy});
+
+        // Try to get the element count from arg 0 of the defining call op.
+        mlir::Value elemCount;
+        if (auto callOp = src.getDefiningOp<mlir::func::CallOp>()) {
+          auto args = callOp.getArgOperands();
+          if (!args.empty()) {
+            elemCount = args[0];
+            // Normalise to i64.
+            if (!elemCount.getType().isInteger(64))
+              elemCount = mlir::LLVM::ZExtOp::create(rewriter, castLoc,
+                                                     i64Ty, elemCount);
+          }
+        }
+        if (!elemCount)
+          elemCount = mlir::LLVM::ConstantOp::create(
+              rewriter, castLoc, i64Ty, rewriter.getI64IntegerAttr(0));
+
+        auto zero64 = mlir::LLVM::ConstantOp::create(
+            rewriter, castLoc, i64Ty, rewriter.getI64IntegerAttr(0));
+        auto one64 = mlir::LLVM::ConstantOp::create(
+            rewriter, castLoc, i64Ty, rewriter.getI64IntegerAttr(1));
+
+        mlir::MemRefDescriptor desc =
+            mlir::MemRefDescriptor::poison(rewriter, castLoc, descTy);
+        desc.setAllocatedPtr(rewriter, castLoc, src);
+        desc.setAlignedPtr(rewriter, castLoc, src);
+        desc.setOffset(rewriter, castLoc, zero64);
+        desc.setSize(rewriter, castLoc, 0, elemCount);
+        desc.setStride(rewriter, castLoc, 0, one64);
+
+        // Wrap the LLVM struct in an unrealized cast back to the memref type.
+        // finalize-memref-to-llvm will see the struct through this cast and
+        // use it directly; reconcile-unrealized-casts removes the wrapper.
         rewriter.replaceOpWithNewOp<mlir::UnrealizedConversionCastOp>(
-            op, newDstType, src);
+            op, newDstType, static_cast<mlir::Value>(desc));
         return mlir::success();
       }
       return op.emitError() << "bitcast lowering from " << srcType << " to "
@@ -2091,41 +2176,24 @@ class CIRGetElementOpLowering
       index =
           mlir::arith::IndexCastOp::create(rewriter, loc, indexType, index);
 
-    // Convert the destination type.
-    auto dstType =
-        cast<mlir::MemRefType>(getTypeConverter()->convertType(op.getType()));
-    auto baseMemref =
-        llvm::cast<mlir::MemRefType>(adaptor.getBase().getType());
+    mlir::Value baseVal = peelUrcast(adaptor.getBase());
+    auto baseMemref = llvm::cast<mlir::MemRefType>(baseVal.getType());
 
     mlir::Value one = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
-    mlir::Value zero = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
 
     llvm::SmallVector<mlir::OpFoldResult> svOffsets = {
         mlir::OpFoldResult(index)};
     llvm::SmallVector<mlir::OpFoldResult> svSizes = {mlir::OpFoldResult(one)};
-    llvm::SmallVector<mlir::OpFoldResult> svStrides = {mlir::OpFoldResult(one)};
+    llvm::SmallVector<mlir::OpFoldResult> svStrides = {rewriter.getIndexAttr(1)};
 
     auto svType = mlir::memref::SubViewOp::inferResultType(baseMemref, svOffsets,
                                                            svSizes, svStrides);
     auto sv = mlir::memref::SubViewOp::create(
-        rewriter, loc, llvm::cast<mlir::MemRefType>(svType), adaptor.getBase(),
+        rewriter, loc, llvm::cast<mlir::MemRefType>(svType), baseVal,
         svOffsets, svSizes, svStrides);
 
-    llvm::SmallVector<mlir::OpFoldResult> rcSizes, rcStrides;
-    for (int64_t dim : dstType.getShape())
-      rcSizes.push_back(mlir::ShapedType::isDynamic(dim)
-                            ? mlir::OpFoldResult(one)
-                            : rewriter.getIndexAttr(dim));
-    llvm::SmallVector<int64_t, 4> strideVals;
-    int64_t layoutOff;
-    (void)dstType.getStridesAndOffset(strideVals, layoutOff);
-    for (int64_t s : strideVals)
-      rcStrides.push_back(rewriter.getIndexAttr(s));
-
-    rewriter.replaceOpWithNewOp<mlir::memref::ReinterpretCastOp>(
-        op, dstType, sv.getResult(), rewriter.getIndexAttr(0), rcSizes,
-        rcStrides);
-
+    // Return the subview directly so its offset is preserved for correct GEPs.
+    rewriter.replaceOp(op, sv.getResult());
     return mlir::success();
   }
 };
@@ -2193,13 +2261,11 @@ public:
     mlir::Value remaining =
         mlir::arith::SubIOp::create(rewriter, loc, totalSize, stride);
 
-    mlir::Value one = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
-
     llvm::SmallVector<mlir::OpFoldResult> svOffsets = {
         mlir::OpFoldResult(stride)};
     llvm::SmallVector<mlir::OpFoldResult> svSizes = {
         mlir::OpFoldResult(remaining)};
-    llvm::SmallVector<mlir::OpFoldResult> svStrides = {mlir::OpFoldResult(one)};
+    llvm::SmallVector<mlir::OpFoldResult> svStrides = {rewriter.getIndexAttr(1)};
 
     auto svType = mlir::memref::SubViewOp::inferResultType(baseMemref, svOffsets,
                                                            svSizes, svStrides);
@@ -2218,26 +2284,30 @@ public:
     for (int64_t s : strideVals)
       rcStrides.push_back(rewriter.getIndexAttr(s));
 
+    if (sv.getType() == memrefType) {
+      rewriter.replaceOp(op, sv.getResult());
+      return mlir::success();
+    }
+
+    // Return the ABI-compatible memref type expected by the type converter,
+    // while keeping the structural subview visible as the cast source.
     rewriter.replaceOpWithNewOp<mlir::memref::ReinterpretCastOp>(
         op, memrefType, sv.getResult(), rewriter.getIndexAttr(0), rcSizes,
         rcStrides);
-
     return mlir::success();
   }
 
   mlir::LogicalResult
   matchAndRewrite(cir::PtrStrideOp op, OpAdaptor adaptor,
                   mlir::ConversionPatternRewriter &rewriter) const override {
-    if (isLoadStoreOrCastArrayToPtrProduer(op)) {
-      if (!isa<cir::ArrayType>(op.getType().getPointee()))
-        return rewritePtrStrideToReinterpret(op, adaptor.getBase(), adaptor,
-                                             rewriter);
-    }
+    if (!isa<cir::ArrayType>(op.getType().getPointee()))
+      return rewritePtrStrideToReinterpret(op, peelUrcast(adaptor.getBase()),
+                                           adaptor, rewriter);
 
     // Rank-preserving subview for pointer-to-array stride. The base memref may
     // be multi-dimensional (e.g. memref<?xNxT> for int (*p)[N]). Stride on
     // dimension 0; all inner dimensions are preserved at their full extent.
-    auto base = adaptor.getBase();
+    auto base = peelUrcast(adaptor.getBase());
     auto stride = adaptor.getStride();
     auto loc = op.getLoc();
     auto indexType = rewriter.getIndexType();
@@ -2248,7 +2318,6 @@ public:
       stride =
           mlir::arith::IndexCastOp::create(rewriter, loc, indexType, stride);
 
-    mlir::Value one = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
     mlir::Value zero = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
 
     llvm::SmallVector<mlir::OpFoldResult> svOffsets, svSizes, svStrides;
@@ -2267,7 +2336,7 @@ public:
         mlir::arith::SubIOp::create(rewriter, loc, totalD0, stride);
     svOffsets.push_back(mlir::OpFoldResult(stride));
     svSizes.push_back(mlir::OpFoldResult(remaining));
-    svStrides.push_back(mlir::OpFoldResult(one));
+    svStrides.push_back(rewriter.getIndexAttr(1));
 
     // Higher dimensions: offset = 0, size = static extent, stride = 1.
     for (int64_t d = 1; d < rank; ++d) {
@@ -2282,7 +2351,7 @@ public:
       } else {
         svSizes.push_back(rewriter.getIndexAttr(dimSize));
       }
-      svStrides.push_back(mlir::OpFoldResult(one));
+      svStrides.push_back(rewriter.getIndexAttr(1));
     }
 
     auto svType = mlir::memref::SubViewOp::inferResultType(baseMemref, svOffsets,
@@ -2291,27 +2360,8 @@ public:
         rewriter, loc, llvm::cast<mlir::MemRefType>(svType), base, svOffsets,
         svSizes, svStrides);
 
-    auto resultMemref =
-        llvm::cast<mlir::MemRefType>(convertTy(op.getType()));
-    llvm::SmallVector<mlir::OpFoldResult> rcSizes, rcStrides;
-    // Dim 0 may be dynamic (use `remaining`); higher dims are static.
-    for (auto [d, dim] : llvm::enumerate(resultMemref.getShape())) {
-      if (mlir::ShapedType::isDynamic(dim))
-        rcSizes.push_back(d == 0 ? mlir::OpFoldResult(remaining)
-                                 : mlir::OpFoldResult(
-                                       mlir::memref::DimOp::create(
-                                           rewriter, loc, sv, (int64_t)d)));
-      else
-        rcSizes.push_back(rewriter.getIndexAttr(dim));
-    }
-    llvm::SmallVector<int64_t, 4> strideVals;
-    int64_t layoutOff;
-    (void)resultMemref.getStridesAndOffset(strideVals, layoutOff);
-    for (int64_t s : strideVals)
-      rcStrides.push_back(rewriter.getIndexAttr(s));
-    rewriter.replaceOpWithNewOp<mlir::memref::ReinterpretCastOp>(
-        op, resultMemref, sv.getResult(), rewriter.getIndexAttr(0), rcSizes,
-        rcStrides);
+    // Return the subview directly; same reasoning as rewritePtrStrideToReinterpret.
+    rewriter.replaceOp(op, sv.getResult());
     return mlir::success();
   }
 };
@@ -2498,8 +2548,10 @@ static mlir::TypeConverter prepareTypeConverter() {
     auto maybeAddrSpace =
         converter.convertTypeAttribute(type, type.getAddrSpace());
     mlir::Attribute addrSpace = maybeAddrSpace.value_or(mlir::Attribute());
-    return mlir::MemRefType::get({mlir::ShapedType::kDynamic}, ty,
-                                 mlir::MemRefLayoutAttrInterface(), addrSpace);
+    auto layout = mlir::StridedLayoutAttr::get(
+        type.getContext(), mlir::ShapedType::kDynamic, {1});
+    return mlir::MemRefType::get({mlir::ShapedType::kDynamic}, ty, layout,
+                                 addrSpace);
   });
   converter.addConversion(
       [&](mlir::IntegerType type) -> mlir::Type { return type; });
@@ -2612,7 +2664,30 @@ void ConvertCIRToMLIRPass::runOnOperation() {
   if (mlir::failed(mlir::applyPartialConversion(theModule, target,
                                                 std::move(patterns)))) {
     signalPassFailure();
+    return;
   }
+
+  // Leave SCF loops and memref.alloca_scope intact for standalone MLIR output.
+  // The thesis alias pipeline can parse these dialects directly, and Dylan's
+  // experimental SCF->CF cleanup currently crashes on simple canonical loops.
+
+  // Strip all CIR-specific module attributes so the output is portable to
+  // standard MLIR tools that don't link the CIR dialect.
+  // Migrate cir.triple → llvm.target_triple before removing it.
+  if (auto tripleAttr =
+          theModule->getAttr(cir::CIRDialect::getTripleAttrName()))
+    theModule->setAttr(mlir::LLVM::LLVMDialect::getTargetTripleAttrName(),
+                       tripleAttr);
+
+  theModule->removeAttr(cir::CIRDialect::getSOBAttrName());
+  theModule->removeAttr(cir::CIRDialect::getSourceLanguageAttrName());
+  theModule->removeAttr(cir::CIRDialect::getTripleAttrName());
+  theModule->removeAttr(cir::CIRDialect::getTypeSizeInfoAttrName());
+  theModule->removeAttr(cir::CIRDialect::getOptInfoAttrName());
+  theModule->removeAttr(cir::CIRDialect::getUWTableAttrName());
+  theModule->removeAttr(cir::CIRDialect::getModuleLevelAsmAttrName());
+  // Remove dlti.dl_spec — alias-meta-opt doesn't register the dlti dialect.
+  theModule->removeAttr("dlti.dl_spec");
 }
 
 mlir::ModuleOp lowerFromCIRToMLIRToLLVMDialect(mlir::ModuleOp theModule,

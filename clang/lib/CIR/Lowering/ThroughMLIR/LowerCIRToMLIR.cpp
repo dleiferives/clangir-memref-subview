@@ -546,9 +546,9 @@ public:
     } else {
       auto targetType = mlir::cast<mlir::MemRefType>(
           getTypeConverter()->convertType(op.getResult().getType()));
-      memreftype = mlir::MemRefType::get({1}, targetType.getElementType(),
-                                         targetType.getLayout(),
-                                         targetType.getMemorySpace());
+      memreftype = mlir::MemRefType::get(
+          {1}, targetType.getElementType(),
+          mlir::MemRefLayoutAttrInterface(), targetType.getMemorySpace());
       auto allocaOp = mlir::memref::AllocaOp::create(
           rewriter, op.getLoc(), memreftype, op.getAlignmentAttr());
       // Cast from memref<1xMlirType> to memref<?xMlirType>
@@ -1703,9 +1703,9 @@ public:
     if (!memrefType) {
       mlir::MemRefType resultTypeMemref =
           mlir::cast<mlir::MemRefType>(resultType);
-      memrefType = mlir::MemRefType::get({1}, resultTypeMemref.getElementType(),
-                                         resultTypeMemref.getLayout(),
-                                         resultTypeMemref.getMemorySpace());
+      memrefType = mlir::MemRefType::get(
+          {1}, resultTypeMemref.getElementType(),
+          mlir::MemRefLayoutAttrInterface(), resultTypeMemref.getMemorySpace());
     }
 
     auto symbol = op.getName();
@@ -2176,9 +2176,6 @@ class CIRGetElementOpLowering
       index =
           mlir::arith::IndexCastOp::create(rewriter, loc, indexType, index);
 
-    // Convert the destination type.
-    auto dstType =
-        cast<mlir::MemRefType>(getTypeConverter()->convertType(op.getType()));
     mlir::Value baseVal = peelUrcast(adaptor.getBase());
     auto baseMemref = llvm::cast<mlir::MemRefType>(baseVal.getType());
 
@@ -2187,7 +2184,7 @@ class CIRGetElementOpLowering
     llvm::SmallVector<mlir::OpFoldResult> svOffsets = {
         mlir::OpFoldResult(index)};
     llvm::SmallVector<mlir::OpFoldResult> svSizes = {mlir::OpFoldResult(one)};
-    llvm::SmallVector<mlir::OpFoldResult> svStrides = {mlir::OpFoldResult(one)};
+    llvm::SmallVector<mlir::OpFoldResult> svStrides = {rewriter.getIndexAttr(1)};
 
     auto svType = mlir::memref::SubViewOp::inferResultType(baseMemref, svOffsets,
                                                            svSizes, svStrides);
@@ -2264,13 +2261,11 @@ public:
     mlir::Value remaining =
         mlir::arith::SubIOp::create(rewriter, loc, totalSize, stride);
 
-    mlir::Value one = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
-
     llvm::SmallVector<mlir::OpFoldResult> svOffsets = {
         mlir::OpFoldResult(stride)};
     llvm::SmallVector<mlir::OpFoldResult> svSizes = {
         mlir::OpFoldResult(remaining)};
-    llvm::SmallVector<mlir::OpFoldResult> svStrides = {mlir::OpFoldResult(one)};
+    llvm::SmallVector<mlir::OpFoldResult> svStrides = {rewriter.getIndexAttr(1)};
 
     auto svType = mlir::memref::SubViewOp::inferResultType(baseMemref, svOffsets,
                                                            svSizes, svStrides);
@@ -2288,6 +2283,11 @@ public:
     (void)memrefType.getStridesAndOffset(strideVals, layoutOff);
     for (int64_t s : strideVals)
       rcStrides.push_back(rewriter.getIndexAttr(s));
+
+    if (sv.getType() == memrefType) {
+      rewriter.replaceOp(op, sv.getResult());
+      return mlir::success();
+    }
 
     // Return the ABI-compatible memref type expected by the type converter,
     // while keeping the structural subview visible as the cast source.
@@ -2318,7 +2318,6 @@ public:
       stride =
           mlir::arith::IndexCastOp::create(rewriter, loc, indexType, stride);
 
-    mlir::Value one = mlir::arith::ConstantIndexOp::create(rewriter, loc, 1);
     mlir::Value zero = mlir::arith::ConstantIndexOp::create(rewriter, loc, 0);
 
     llvm::SmallVector<mlir::OpFoldResult> svOffsets, svSizes, svStrides;
@@ -2337,7 +2336,7 @@ public:
         mlir::arith::SubIOp::create(rewriter, loc, totalD0, stride);
     svOffsets.push_back(mlir::OpFoldResult(stride));
     svSizes.push_back(mlir::OpFoldResult(remaining));
-    svStrides.push_back(mlir::OpFoldResult(one));
+    svStrides.push_back(rewriter.getIndexAttr(1));
 
     // Higher dimensions: offset = 0, size = static extent, stride = 1.
     for (int64_t d = 1; d < rank; ++d) {
@@ -2352,7 +2351,7 @@ public:
       } else {
         svSizes.push_back(rewriter.getIndexAttr(dimSize));
       }
-      svStrides.push_back(mlir::OpFoldResult(one));
+      svStrides.push_back(rewriter.getIndexAttr(1));
     }
 
     auto svType = mlir::memref::SubViewOp::inferResultType(baseMemref, svOffsets,
@@ -2549,8 +2548,10 @@ static mlir::TypeConverter prepareTypeConverter() {
     auto maybeAddrSpace =
         converter.convertTypeAttribute(type, type.getAddrSpace());
     mlir::Attribute addrSpace = maybeAddrSpace.value_or(mlir::Attribute());
-    return mlir::MemRefType::get({mlir::ShapedType::kDynamic}, ty,
-                                 mlir::MemRefLayoutAttrInterface(), addrSpace);
+    auto layout = mlir::StridedLayoutAttr::get(
+        type.getContext(), mlir::ShapedType::kDynamic, {1});
+    return mlir::MemRefType::get({mlir::ShapedType::kDynamic}, ty, layout,
+                                 addrSpace);
   });
   converter.addConversion(
       [&](mlir::IntegerType type) -> mlir::Type { return type; });
